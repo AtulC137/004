@@ -32,7 +32,7 @@ async def run_streaming_stt(
         language_code="en-IN",
         sample_rate=16000,
         input_audio_codec="pcm_s16le",
-        high_vad_sensitivity=True,
+        high_vad_sensitivity=False,
         vad_signals=True,
     ) as sarvam_ws:
 

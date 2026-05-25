@@ -17,6 +17,8 @@
       --muted: #4a5568;
       --speech: #00e5ff;
       --transcript: #a3e635;
+      --ai: #f59e0b;
+      --ai-dim: rgba(245,158,11,0.12);
       --error: #f87171;
       --warn: #fbbf24;
     }
@@ -59,7 +61,7 @@
       border-radius: 12px;
       padding: 2rem;
       width: 100%;
-      max-width: 680px;
+      max-width: 720px;
     }
 
     /* Status bar */
@@ -81,10 +83,11 @@
       flex-shrink: 0;
       transition: background 0.3s;
     }
-    .dot.connected { background: var(--transcript); box-shadow: 0 0 6px var(--transcript); }
-    .dot.listening { background: var(--accent); box-shadow: 0 0 8px var(--accent); animation: pulse 1s infinite; }
-    .dot.speech { background: var(--warn); box-shadow: 0 0 8px var(--warn); animation: pulse 0.5s infinite; }
-    .dot.error { background: var(--error); }
+    .dot.connected   { background: var(--transcript); box-shadow: 0 0 6px var(--transcript); }
+    .dot.listening   { background: var(--accent); box-shadow: 0 0 8px var(--accent); animation: pulse 1s infinite; }
+    .dot.speech      { background: var(--warn); box-shadow: 0 0 8px var(--warn); animation: pulse 0.5s infinite; }
+    .dot.thinking    { background: var(--ai); box-shadow: 0 0 8px var(--ai); animation: pulse 0.7s infinite; }
+    .dot.error       { background: var(--error); }
 
     @keyframes pulse {
       0%, 100% { opacity: 1; }
@@ -99,7 +102,7 @@
     }
     #visualizer {
       width: 100%;
-      height: 60px;
+      height: 56px;
       border-radius: 6px;
       background: #0d0d15;
       border: 1px solid var(--border);
@@ -124,56 +127,119 @@
       letter-spacing: 0.05em;
       transition: all 0.15s;
     }
-    #startBtn {
-      background: var(--accent);
-      color: #000;
-    }
+    #startBtn { background: var(--accent); color: #000; }
     #startBtn:hover:not(:disabled) { filter: brightness(1.15); }
     #startBtn:disabled { opacity: 0.4; cursor: not-allowed; }
-
-    #stopBtn {
-      background: transparent;
-      color: var(--error);
-      border: 1px solid var(--error);
-    }
+    #stopBtn { background: transparent; color: var(--error); border: 1px solid var(--error); }
     #stopBtn:hover:not(:disabled) { background: rgba(248,113,113,0.1); }
     #stopBtn:disabled { opacity: 0.3; cursor: not-allowed; }
 
-    /* Transcript area */
-    .transcript-label {
+    /* Two-panel layout */
+    .panels {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+    }
+    @media (max-width: 600px) {
+      .panels { grid-template-columns: 1fr; }
+    }
+
+    .panel-label {
       font-family: 'IBM Plex Mono', monospace;
-      font-size: 0.72rem;
+      font-size: 0.70rem;
       color: var(--muted);
       text-transform: uppercase;
       letter-spacing: 0.08em;
       margin-bottom: 0.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
     }
-    #transcript {
+    .panel-label .badge {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 0.65rem;
+    }
+    .badge-user  { background: rgba(163,230,53,0.15); color: var(--transcript); border: 1px solid rgba(163,230,53,0.3); }
+    .badge-ai    { background: rgba(245,158,11,0.15); color: var(--ai);         border: 1px solid rgba(245,158,11,0.3); }
+
+    .transcript-box {
       background: #0d0d15;
       border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 1rem;
-      min-height: 180px;
-      max-height: 320px;
+      padding: 0.9rem;
+      min-height: 220px;
+      max-height: 340px;
       overflow-y: auto;
       font-family: 'IBM Plex Mono', monospace;
-      font-size: 0.82rem;
-      line-height: 1.6;
+      font-size: 0.80rem;
+      line-height: 1.65;
+      scroll-behavior: smooth;
     }
-    .t-line { margin-bottom: 0.3rem; }
-    .t-user { color: var(--transcript); }
-    .t-user::before { content: "USER ▸ "; color: var(--muted); }
-    .t-event { color: var(--accent); }
-    .t-event::before { content: "──  "; color: var(--border); }
+
+    .t-line { margin-bottom: 0.35rem; }
+    .t-user  { color: var(--transcript); }
+    .t-user::before  { content: "YOU ▸ "; color: var(--muted); }
+    .t-event { color: var(--accent); opacity: 0.6; font-size: 0.72rem; }
     .t-error { color: var(--error); }
     .t-placeholder { color: var(--muted); font-style: italic; }
+
+    /* AI response panel */
+    .ai-box {
+      background: #0d0d15;
+      border: 1px solid rgba(245,158,11,0.25);
+      border-radius: 8px;
+      padding: 0.9rem;
+      min-height: 220px;
+      max-height: 340px;
+      overflow-y: auto;
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 0.80rem;
+      line-height: 1.65;
+      scroll-behavior: smooth;
+    }
+
+    .ai-turn {
+      margin-bottom: 1rem;
+      padding-bottom: 0.75rem;
+      border-bottom: 1px solid rgba(245,158,11,0.1);
+    }
+    .ai-turn:last-child { border-bottom: none; margin-bottom: 0; }
+
+    .ai-turn-label {
+      font-size: 0.65rem;
+      color: rgba(245,158,11,0.5);
+      margin-bottom: 0.3rem;
+      letter-spacing: 0.05em;
+    }
+
+    .ai-turn-text {
+      color: var(--ai);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .ai-turn-text.streaming::after {
+      content: '▌';
+      animation: blink 0.6s step-end infinite;
+      color: var(--ai);
+      opacity: 0.8;
+    }
+
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0; }
+    }
+
+    .ai-placeholder { color: var(--muted); font-style: italic; }
   </style>
 </head>
 <body>
 
 <div class="header">
   <h1>Voice Event Assistant</h1>
-  <p>Streaming STT · Sarvam Saaras v3 · Real-time</p>
+  <p>Adobe Exclusive Roundtable · Sarvam STT + LLM · Hinglish</p>
 </div>
 
 <div class="card">
@@ -191,38 +257,55 @@
     <button id="stopBtn" disabled>■ Stop</button>
   </div>
 
-  <div class="transcript-label">Live Transcript</div>
-  <div id="transcript">
-    <div class="t-line t-placeholder">Transcript will appear here...</div>
+  <div class="panels">
+    <div>
+      <div class="panel-label">
+        Live Transcript <span class="badge badge-user">YOU</span>
+      </div>
+      <div class="transcript-box" id="transcript">
+        <div class="t-line t-placeholder">Aapki awaaz yahaan aayegi...</div>
+      </div>
+    </div>
+    <div>
+      <div class="panel-label">
+        AI Response <span class="badge badge-ai">ASSISTANT</span>
+      </div>
+      <div class="ai-box" id="aiBox">
+        <div class="ai-placeholder">AI ka jawab yahaan aayega...</div>
+      </div>
+    </div>
   </div>
 </div>
 
 <script>
   const WS_URL = 'ws://localhost:8000/ws/audio';
   const SAMPLE_RATE = 16000;
-  const CHUNK_SIZE = 4096; // samples per worklet message
+  const CHUNK_SIZE = 4096;
 
-  const startBtn = document.getElementById('startBtn');
-  const stopBtn = document.getElementById('stopBtn');
+  const startBtn    = document.getElementById('startBtn');
+  const stopBtn     = document.getElementById('stopBtn');
   const transcriptEl = document.getElementById('transcript');
-  const statusText = document.getElementById('statusText');
-  const dot = document.getElementById('dot');
+  const aiBox       = document.getElementById('aiBox');
+  const statusText  = document.getElementById('statusText');
+  const dot         = document.getElementById('dot');
 
-  let ws = null;
-  let audioCtx = null;
-  let mediaStream = null;
-  let workletNode = null;
-  let sourceNode = null;
-  let animFrameId = null;
-  let analyser = null;
+  let ws = null, audioCtx = null, mediaStream = null;
+  let workletNode = null, sourceNode = null;
+  let animFrameId = null, analyser = null;
   let firstTranscript = true;
+  let firstAI = true;
 
-  // --- Visualizer ---
+  // Current streaming AI turn element
+  let currentAiTurnEl = null;
+  let currentAiTextEl = null;
+  let currentAiBuffer = '';
+
+  // ── Canvas visualizer ──────────────────────────────────────────────────
   const canvas = document.getElementById('visualizer');
-  const ctx = canvas.getContext('2d');
+  const ctx2d  = canvas.getContext('2d');
 
   function resizeCanvas() {
-    canvas.width = canvas.offsetWidth;
+    canvas.width  = canvas.offsetWidth;
     canvas.height = canvas.offsetHeight;
   }
   resizeCanvas();
@@ -230,14 +313,14 @@
 
   function drawIdle() {
     resizeCanvas();
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx2d.clearRect(0, 0, canvas.width, canvas.height);
     const mid = canvas.height / 2;
-    ctx.strokeStyle = '#1e1e2e';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(0, mid);
-    ctx.lineTo(canvas.width, mid);
-    ctx.stroke();
+    ctx2d.strokeStyle = '#1e1e2e';
+    ctx2d.lineWidth = 1.5;
+    ctx2d.beginPath();
+    ctx2d.moveTo(0, mid);
+    ctx2d.lineTo(canvas.width, mid);
+    ctx2d.stroke();
   }
   drawIdle();
 
@@ -246,34 +329,32 @@
     animFrameId = requestAnimationFrame(drawWaveform);
     resizeCanvas();
     const bufLen = analyser.fftSize;
-    const data = new Float32Array(bufLen);
+    const data   = new Float32Array(bufLen);
     analyser.getFloatTimeDomainData(data);
-
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.strokeStyle = '#00e5ff';
-    ctx.lineWidth = 1.5;
-    ctx.shadowBlur = 6;
-    ctx.shadowColor = '#00e5ff44';
-    ctx.beginPath();
-
+    ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+    ctx2d.strokeStyle = '#00e5ff';
+    ctx2d.lineWidth   = 1.5;
+    ctx2d.shadowBlur  = 6;
+    ctx2d.shadowColor = '#00e5ff44';
+    ctx2d.beginPath();
     const sliceW = canvas.width / bufLen;
     let x = 0;
     for (let i = 0; i < bufLen; i++) {
       const y = (data[i] * 0.5 + 0.5) * canvas.height;
-      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      i === 0 ? ctx2d.moveTo(x, y) : ctx2d.lineTo(x, y);
       x += sliceW;
     }
-    ctx.stroke();
-    ctx.shadowBlur = 0;
+    ctx2d.stroke();
+    ctx2d.shadowBlur = 0;
   }
 
-  // --- Status helpers ---
+  // ── Status helpers ─────────────────────────────────────────────────────
   function setStatus(state, msg) {
     dot.className = 'dot ' + state;
     statusText.textContent = msg;
   }
 
-  function addLine(cls, text) {
+  function addTranscriptLine(cls, text) {
     if (firstTranscript) {
       transcriptEl.innerHTML = '';
       firstTranscript = false;
@@ -285,55 +366,115 @@
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
   }
 
-  // --- Main streaming logic ---
+  // ── AI streaming helpers ───────────────────────────────────────────────
+  function startAiTurn() {
+    if (firstAI) {
+      aiBox.innerHTML = '';
+      firstAI = false;
+    }
+    currentAiBuffer = '';
+
+    const turn = document.createElement('div');
+    turn.className = 'ai-turn';
+
+    const label = document.createElement('div');
+    label.className = 'ai-turn-label';
+    label.textContent = 'ASSISTANT ▸';
+    turn.appendChild(label);
+
+    const textEl = document.createElement('div');
+    textEl.className = 'ai-turn-text streaming';
+    turn.appendChild(textEl);
+
+    aiBox.appendChild(turn);
+    aiBox.scrollTop = aiBox.scrollHeight;
+
+    currentAiTurnEl = turn;
+    currentAiTextEl = textEl;
+  }
+
+  function appendAiToken(token) {
+    if (!currentAiTextEl) return;
+    currentAiBuffer += token;
+    currentAiTextEl.textContent = currentAiBuffer;
+    aiBox.scrollTop = aiBox.scrollHeight;
+  }
+
+  function finalizeAiTurn(fullText) {
+    if (currentAiTextEl) {
+      currentAiTextEl.classList.remove('streaming');
+      if (fullText) currentAiTextEl.textContent = fullText;
+    }
+    currentAiTurnEl = null;
+    currentAiTextEl = null;
+    currentAiBuffer = '';
+  }
+
+  // ── WebSocket message handler ──────────────────────────────────────────
+  function handleMessage(evt) {
+    let msg;
+    try { msg = JSON.parse(evt.data); } catch (_) { return; }
+
+    switch (msg.type) {
+      case 'speech_start':
+        setStatus('speech', 'Listening · Speech detected');
+        addTranscriptLine('t-event', '── speech detected');
+        break;
+
+      case 'speech_end':
+        setStatus('listening', 'Listening · Waiting for speech');
+        addTranscriptLine('t-event', '── speech ended');
+        break;
+
+      case 'transcript':
+        if (msg.text) addTranscriptLine('t-user', msg.text);
+        break;
+
+      case 'llm_start':
+        setStatus('thinking', 'AI thinking...');
+        startAiTurn();
+        break;
+
+      case 'llm_token':
+        if (msg.token) appendAiToken(msg.token);
+        break;
+
+      case 'llm_end':
+        setStatus('listening', 'Listening · Speak now');
+        finalizeAiTurn(msg.text || '');
+        break;
+
+      case 'llm_error':
+        setStatus('error', 'AI error');
+        finalizeAiTurn('');
+        if (currentAiTextEl) {
+          currentAiTextEl.style.color = 'var(--error)';
+          currentAiTextEl.textContent = msg.text || 'Error';
+        }
+        break;
+    }
+  }
+
+  // ── Start ──────────────────────────────────────────────────────────────
   startBtn.addEventListener('click', async () => {
     startBtn.disabled = true;
-    stopBtn.disabled = false;
+    stopBtn.disabled  = false;
     setStatus('', 'Connecting...');
 
     try {
-      // 1. Connect WebSocket
       ws = new WebSocket(WS_URL);
       ws.binaryType = 'arraybuffer';
 
-      ws.onopen = () => {
-        setStatus('connected', 'Connected · Starting mic...');
-        startMic();
-      };
-
-      ws.onmessage = (evt) => {
-        try {
-          const msg = JSON.parse(evt.data);
-          if (msg.type === 'speech_start') {
-            setStatus('speech', 'Listening · Speech detected');
-            addLine('t-event', 'Speech detected');
-          } else if (msg.type === 'speech_end') {
-            setStatus('listening', 'Listening · Waiting for speech');
-            addLine('t-event', 'Speech ended');
-          } else if (msg.type === 'transcript' && msg.text) {
-            addLine('t-user', msg.text);
-          }
-        } catch (_) {}
-      };
-
-      ws.onerror = () => {
-        setStatus('error', 'WebSocket error');
-        addLine('t-error', 'WebSocket connection error');
-        cleanup();
-      };
-
-      ws.onclose = () => {
-        if (stopBtn.disabled === false) {
-          setStatus('', 'Disconnected');
-        }
-        cleanup();
-      };
+      ws.onopen    = () => { setStatus('connected', 'Connected · Starting mic...'); startMic(); };
+      ws.onmessage = handleMessage;
+      ws.onerror   = () => { setStatus('error', 'WebSocket error'); addTranscriptLine('t-error', 'WebSocket error'); cleanup(); };
+      ws.onclose   = () => { if (!stopBtn.disabled) setStatus('', 'Disconnected'); cleanup(); };
 
     } catch (err) {
       setStatus('error', 'Failed: ' + err.message);
-      addLine('t-error', err.message);
+      addTranscriptLine('t-error', err.message);
       startBtn.disabled = false;
-      stopBtn.disabled = true;
+      stopBtn.disabled  = true;
     }
   });
 
@@ -341,28 +482,22 @@
     cleanup();
     setStatus('', 'Stopped');
     startBtn.disabled = false;
-    stopBtn.disabled = true;
+    stopBtn.disabled  = true;
     drawIdle();
   });
 
   async function startMic() {
     try {
       mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          sampleRate: SAMPLE_RATE,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
+        audio: { channelCount: 1, sampleRate: SAMPLE_RATE,
+                 echoCancellation: true, noiseSuppression: true, autoGainControl: true }
       });
 
       audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
       await audioCtx.audioWorklet.addModule('/pcm-processor.js');
 
       sourceNode = audioCtx.createMediaStreamSource(mediaStream);
-
-      analyser = audioCtx.createAnalyser();
+      analyser   = audioCtx.createAnalyser();
       analyser.fftSize = 1024;
       sourceNode.connect(analyser);
 
@@ -371,10 +506,7 @@
       });
 
       workletNode.port.onmessage = (e) => {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          // e.data is Int16Array
-          ws.send(e.data.buffer);
-        }
+        if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data.buffer);
       };
 
       sourceNode.connect(workletNode);
@@ -385,21 +517,22 @@
 
     } catch (err) {
       setStatus('error', 'Mic error: ' + err.message);
-      addLine('t-error', 'Mic error: ' + err.message);
+      addTranscriptLine('t-error', 'Mic error: ' + err.message);
       cleanup();
       startBtn.disabled = false;
-      stopBtn.disabled = true;
+      stopBtn.disabled  = true;
     }
   }
 
   function cleanup() {
     if (animFrameId) { cancelAnimationFrame(animFrameId); animFrameId = null; }
     if (workletNode) { workletNode.disconnect(); workletNode = null; }
-    if (sourceNode) { sourceNode.disconnect(); sourceNode = null; }
+    if (sourceNode)  { sourceNode.disconnect(); sourceNode = null; }
     analyser = null;
-    if (audioCtx) { audioCtx.close(); audioCtx = null; }
+    if (audioCtx)    { audioCtx.close(); audioCtx = null; }
     if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
     if (ws && ws.readyState === WebSocket.OPEN) { ws.close(); ws = null; }
+    finalizeAiTurn('');
   }
 </script>
 </body>
