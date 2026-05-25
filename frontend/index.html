@@ -88,6 +88,7 @@
     .dot.speech      { background: var(--warn); box-shadow: 0 0 8px var(--warn); animation: pulse 0.5s infinite; }
     .dot.thinking    { background: var(--ai); box-shadow: 0 0 8px var(--ai); animation: pulse 0.7s infinite; }
     .dot.speaking    { background: #a855f7; box-shadow: 0 0 8px #a855f7; animation: pulse 0.8s infinite; }
+    .dot.interrupted { background: var(--error); box-shadow: 0 0 8px var(--error); }
     .dot.error       { background: var(--error); }
 
     @keyframes pulse {
@@ -228,6 +229,17 @@
       opacity: 0.8;
     }
 
+    /* Interrupted turn gets a visual marker */
+    .ai-turn-text.interrupted {
+      opacity: 0.45;
+    }
+    .ai-turn-text.interrupted::after {
+      content: ' ✕';
+      color: var(--error);
+      animation: none;
+      opacity: 0.7;
+    }
+
     @keyframes blink {
       0%, 100% { opacity: 1; }
       50% { opacity: 0; }
@@ -240,7 +252,7 @@
 
 <div class="header">
   <h1>Voice Event Assistant</h1>
-  <p>Adobe Exclusive Roundtable · Sarvam STT + LLM · ElevenLabs TTS · Hinglish</p>
+  <p>Adobe Exclusive Roundtable · Sarvam STT + LLM · Sarvam TTS · Hinglish</p>
 </div>
 
 <div class="card">
@@ -279,16 +291,16 @@
 </div>
 
 <script>
-  const WS_URL = 'ws://localhost:8000/ws/audio';
+  const WS_URL     = 'ws://localhost:8000/ws/audio';
   const SAMPLE_RATE = 16000;
-  const CHUNK_SIZE = 4096;
+  const CHUNK_SIZE  = 4096;
 
-  const startBtn    = document.getElementById('startBtn');
-  const stopBtn     = document.getElementById('stopBtn');
+  const startBtn     = document.getElementById('startBtn');
+  const stopBtn      = document.getElementById('stopBtn');
   const transcriptEl = document.getElementById('transcript');
-  const aiBox       = document.getElementById('aiBox');
-  const statusText  = document.getElementById('statusText');
-  const dot         = document.getElementById('dot');
+  const aiBox        = document.getElementById('aiBox');
+  const statusText   = document.getElementById('statusText');
+  const dot          = document.getElementById('dot');
 
   let ws = null, audioCtx = null, mediaStream = null;
   let workletNode = null, sourceNode = null;
@@ -302,26 +314,51 @@
   let currentAiBuffer = '';
 
   // ── TTS Audio Engine ───────────────────────────────────────────────────
-  // Queues MP3 chunks from server, decodes + plays them in order via Web Audio.
-  // Uses a chain of AudioBufferSourceNodes scheduled back-to-back for gapless playback.
-  let ttsAudioCtx = null;       // Separate AudioContext for TTS playback
-  let ttsNextStartTime = 0;     // When to schedule next audio chunk
-  let ttsChunkBuffer = [];      // Raw MP3 byte accumulator
-  let ttsPlaying = false;
+  //
+  // INTERRUPT DESIGN:
+  //   Uses Web Audio API scheduled BufferSourceNodes.
+  //   Each decoded MP3 chunk becomes a node scheduled at ttsNextPlayAt.
+  //   On interrupt: src.stop(0) kills ALL nodes — including pre-scheduled
+  //   future ones — instantly. No tail audio plays after stopTtsNow().
+  //
+  //   Streaming latency is preserved: chunks still flow LLM→TTS→WS→browser
+  //   continuously. We just decode them into stoppable nodes instead of
+  //   a single audio element.
+  //
+  let ttsAudioCtx      = null;
+  let ttsNextPlayAt    = 0;         // Web Audio scheduling cursor
+  let ttsChunkBuffer   = [];        // Raw MP3 byte accumulator (Uint8Array[])
+  let ttsPlaying       = false;
+  let ttsScheduled     = [];        // All live AudioBufferSourceNodes — for stop()
+
+  // Minimum bytes before we attempt MP3 decode.
+  // MP3 needs complete frames; too small = decode error.
+  // 32KB ≈ 2s at 128kbps — adjust lower if your TTS chunks are larger.
+  const TTS_DECODE_THRESHOLD = 32 * 1024;
 
   function getTtsAudioCtx() {
     if (!ttsAudioCtx || ttsAudioCtx.state === 'closed') {
-      ttsAudioCtx = new AudioContext();
-      ttsNextStartTime = 0;
+      ttsAudioCtx  = new AudioContext();
+      ttsNextPlayAt = 0;
     }
     return ttsAudioCtx;
   }
 
-  // Accumulate incoming binary frames, then decode + schedule when we have enough data.
-  // MP3 needs a minimum frame size to decode cleanly — we buffer until tts_end or 32KB.
-  const TTS_DECODE_THRESHOLD = 32 * 1024; // 32KB — enough for ~1s of MP3 at 128kbps
+  // Called on interrupt — stops ALL scheduled audio nodes immediately.
+  // This is the key function that makes interrupts feel instant.
+  function stopTtsNow() {
+    ttsPlaying    = false;
+    ttsChunkBuffer = [];
+    // stop(0) works on nodes that haven't started yet — kills pre-buffered future audio
+    ttsScheduled.forEach(src => {
+      try { src.stop(0); } catch (_) {}
+    });
+    ttsScheduled  = [];
+    ttsNextPlayAt = 0;
+  }
 
   async function enqueueTtsChunk(arrayBuffer) {
+    if (!ttsPlaying) return; // already interrupted — drop incoming chunk
     ttsChunkBuffer.push(new Uint8Array(arrayBuffer));
     const totalBytes = ttsChunkBuffer.reduce((s, c) => s + c.length, 0);
     if (totalBytes >= TTS_DECODE_THRESHOLD) {
@@ -332,39 +369,52 @@
   async function flushTtsBuffer() {
     if (ttsChunkBuffer.length === 0) return;
 
-    // Merge all buffered chunks into one ArrayBuffer
+    // Merge all buffered chunks
     const totalBytes = ttsChunkBuffer.reduce((s, c) => s + c.length, 0);
-    const merged = new Uint8Array(totalBytes);
-    let offset = 0;
+    const merged     = new Uint8Array(totalBytes);
+    let offset       = 0;
     for (const chunk of ttsChunkBuffer) {
       merged.set(chunk, offset);
       offset += chunk.length;
     }
     ttsChunkBuffer = [];
 
+    // Guard: if interrupted while we were accumulating, drop this batch
+    if (!ttsPlaying) return;
+
     try {
       const ctx = getTtsAudioCtx();
       const audioBuffer = await ctx.decodeAudioData(merged.buffer);
 
-      const source = ctx.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(ctx.destination);
+      // Guard again: interrupt may have fired during async decode
+      if (!ttsPlaying) return;
 
-      // Schedule gapless: start exactly when previous chunk ends
-      const now = ctx.currentTime;
-      const startAt = Math.max(now + 0.05, ttsNextStartTime); // 50ms buffer for scheduling
-      source.start(startAt);
-      ttsNextStartTime = startAt + audioBuffer.duration;
+      const src = ctx.createBufferSource();
+      src.buffer = audioBuffer;
+      src.connect(ctx.destination);
+
+      // Self-remove from tracked list when node finishes naturally
+      src.onended = () => {
+        ttsScheduled = ttsScheduled.filter(s => s !== src);
+      };
+
+      // Schedule gapless — start exactly when previous chunk ends
+      const now   = ctx.currentTime;
+      const start = Math.max(now + 0.05, ttsNextPlayAt); // 50ms scheduling headroom
+      src.start(start);
+      ttsNextPlayAt = start + audioBuffer.duration;
+
+      // Track node so stopTtsNow() can kill it
+      ttsScheduled.push(src);
+
     } catch (err) {
-      // Partial MP3 frames can fail to decode — silently skip
+      // Partial MP3 frames fail decode — silently drop
       console.warn('[TTS] Decode error (partial frame?):', err.message);
     }
   }
 
   function resetTtsEngine() {
-    ttsChunkBuffer = [];
-    ttsNextStartTime = 0;
-    ttsPlaying = false;
+    stopTtsNow();
   }
 
   // ── Canvas visualizer ──────────────────────────────────────────────────
@@ -417,7 +467,7 @@
 
   // ── Status helpers ─────────────────────────────────────────────────────
   function setStatus(state, msg) {
-    dot.className = 'dot ' + state;
+    dot.className  = 'dot ' + state;
     statusText.textContent = msg;
   }
 
@@ -427,7 +477,7 @@
       firstTranscript = false;
     }
     const div = document.createElement('div');
-    div.className = 't-line ' + cls;
+    div.className   = 't-line ' + cls;
     div.textContent = text;
     transcriptEl.appendChild(div);
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
@@ -445,7 +495,7 @@
     turn.className = 'ai-turn';
 
     const label = document.createElement('div');
-    label.className = 'ai-turn-label';
+    label.className   = 'ai-turn-label';
     label.textContent = 'ASSISTANT ▸';
     turn.appendChild(label);
 
@@ -477,8 +527,20 @@
     currentAiBuffer = '';
   }
 
+  // Mark current AI turn as interrupted (dimmed + ✕ marker)
+  function markAiTurnInterrupted() {
+    if (currentAiTextEl) {
+      currentAiTextEl.classList.remove('streaming');
+      currentAiTextEl.classList.add('interrupted');
+    }
+    currentAiTurnEl = null;
+    currentAiTextEl = null;
+    currentAiBuffer = '';
+  }
+
   // ── WebSocket message handler ──────────────────────────────────────────
   function handleMessage(evt) {
+
     // Binary frame = TTS audio chunk
     if (evt.data instanceof ArrayBuffer) {
       if (ttsPlaying) enqueueTtsChunk(evt.data);
@@ -489,6 +551,17 @@
     try { msg = JSON.parse(evt.data); } catch (_) { return; }
 
     switch (msg.type) {
+
+      // ── INTERRUPT ────────────────────────────────────────────────────
+      // Server confirms cancellation of LLM+TTS tasks.
+      // Stop all audio immediately — this is the core of interrupt handling.
+      case 'interrupted':
+        stopTtsNow();                             // kill all scheduled audio nodes NOW
+        markAiTurnInterrupted();                  // dim the partial AI text in UI
+        setStatus('interrupted', 'Interrupted · Listening...');
+        addTranscriptLine('t-event', '── interrupted');
+        break;
+
       case 'speech_start':
         setStatus('speech', 'Listening · Speech detected');
         addTranscriptLine('t-event', '── speech detected');
@@ -527,15 +600,15 @@
         break;
 
       case 'tts_start':
-        ttsPlaying = true;
+        ttsPlaying     = true;
         ttsChunkBuffer = [];
-        // Reset scheduling so new response starts fresh
-        if (ttsAudioCtx) ttsNextStartTime = ttsAudioCtx.currentTime;
+        ttsScheduled   = [];
+        if (ttsAudioCtx) ttsNextPlayAt = ttsAudioCtx.currentTime;
         setStatus('speaking', 'AI speaking...');
         break;
 
       case 'tts_end':
-        // Flush any remaining buffered bytes
+        // Flush any remaining buffered bytes, then mark done
         flushTtsBuffer().then(() => {
           ttsPlaying = false;
           setStatus('listening', 'Listening · Speak now');
@@ -544,7 +617,7 @@
     }
   }
 
-  // ── Start ──────────────────────────────────────────────────────────────
+  // ── Start button ───────────────────────────────────────────────────────
   startBtn.addEventListener('click', async () => {
     startBtn.disabled = true;
     stopBtn.disabled  = false;
@@ -578,8 +651,13 @@
   async function startMic() {
     try {
       mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, sampleRate: SAMPLE_RATE,
-                 echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+        audio: {
+          channelCount:     1,
+          sampleRate:       SAMPLE_RATE,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl:  true
+        }
       });
 
       audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
@@ -591,11 +669,31 @@
       sourceNode.connect(analyser);
 
       workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor', {
-        processorOptions: { chunkSize: CHUNK_SIZE }
+        processorOptions: {
+          chunkSize:        CHUNK_SIZE,
+          energyThreshold:  0.002,   // tune: louder room → raise to 0.004
+          silenceThreshold: 0.0005,
+          speechFrameGate:  3,       // frames before speech_energy fires (~6ms)
+          silenceFrameGate: 20       // frames of quiet before state resets (~40ms)
+        }
       });
 
       workletNode.port.onmessage = (e) => {
-        if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data.buffer);
+        // ── INTERRUPT SIGNAL from PCMProcessor ──────────────────────────
+        // This fires BEFORE Sarvam VAD — gives ~200-400ms earlier interrupt.
+        // Only send to server if AI is currently active (TTS playing or LLM running).
+        if (e.data && e.data.type === 'speech_energy_detected') {
+          if (ttsPlaying && ws && ws.readyState === WebSocket.OPEN) {
+            stopTtsNow();   // stop local audio immediately — don't wait for server round-trip
+            ws.send(JSON.stringify({ type: 'client_interrupt' }));
+          }
+          return;
+        }
+
+        // PCM audio chunk → send to server for STT
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(e.data.buffer);
+        }
       };
 
       sourceNode.connect(workletNode);

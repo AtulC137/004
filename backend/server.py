@@ -1,23 +1,13 @@
 """
-server.py
-FastAPI backend.
+server.py — interrupt handling with correct set-based task tracking.
 
-Endpoint:  ws://localhost:8000/ws/audio
-Protocol:
-  - Browser sends raw binary PCM frames (Int16, 16kHz, mono)
-  - Server forwards to Sarvam STT via stt.py
-  - LLM fires ONCE per speech turn: triggered by speech_end + last transcript
-  - Server sends JSON events back to browser:
-      {"type": "speech_start"}
-      {"type": "speech_end"}
-      {"type": "transcript", "text": "..."}
-      {"type": "llm_start"}
-      {"type": "llm_token", "token": "..."}
-      {"type": "llm_end", "text": "..."}
-      {"type": "llm_error", "text": "..."}
+INTERRUPT ADDITION:
+  Handles both binary (audio) and text (JSON control) WebSocket messages.
+  Accepts { type: 'client_interrupt' } from the browser, which fires when
+  the PCMProcessor detects speech energy — BEFORE Sarvam VAD fires.
+  This gives ~200-400ms earlier cancellation of LLM + TTS tasks.
 
-FIX: Sarvam sends speech_end ~200ms BEFORE the transcript arrives.
-     _wait_and_run_llm() waits 500ms for the transcript to land before giving up.
+IMPORTANT: _active_tasks is a SET, not a list. Tasks self-remove via done_callback.
 """
 
 import asyncio
@@ -32,23 +22,15 @@ from stt import run_streaming_stt
 import llm as llm_module
 import tts as tts_module
 
-# ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     stream=sys.stdout,
 )
 logger = logging.getLogger("server")
 
-# ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Voice Event Assistant - STT + LLM Backend")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Voice Event Assistant")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 @app.on_event("shutdown")
@@ -69,52 +51,27 @@ async def audio_ws(websocket: WebSocket):
 
     audio_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
     stop_event = asyncio.Event()
-
-    # Per-session state
     conversation_history: list = []
-    llm_lock = asyncio.Lock()
-    tts_lock = asyncio.Lock()
-
-    # Buffer: accumulate transcript chunks during a speech turn.
-    # Reset on speech_start, finalized on speech_end.
     _transcript_buffer: list = []
 
-    # ── Event callback ────────────────────────────────────────────────────
-    async def on_event(event_type: str, text: str):
-        nonlocal _transcript_buffer
+    # SET — tasks add themselves on spawn, auto-remove on completion
+    _active_tasks: set = set()
+    _turn_cancel: asyncio.Event = asyncio.Event()
 
-        if event_type == "speech_start":
-            # New turn — clear buffer
-            _transcript_buffer = []
-            await _send({"type": "speech_start"})
+    def _spawn(coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        _active_tasks.add(task)
+        task.add_done_callback(_active_tasks.discard)
+        return task
 
-        elif event_type == "transcript" and text:
-            # Accumulate partial/final transcripts; send to browser live
-            _transcript_buffer.append(text)
-            await _send({"type": "transcript", "text": text})
+    def _interrupt():
+        _turn_cancel.set()
+        for t in list(_active_tasks):
+            t.cancel()
 
-        elif event_type == "speech_end":
-            await _send({"type": "speech_end"})
-            # Sarvam sends speech_end ~200ms BEFORE the transcript arrives.
-            # If buffer is already populated, fire immediately.
-            # Otherwise wait briefly for the transcript to land.
-            if _transcript_buffer:
-                final_transcript = _transcript_buffer[-1]
-                logger.info(f"[TURN END] Final transcript: {final_transcript!r}")
-                asyncio.create_task(_run_llm(final_transcript))
-            else:
-                asyncio.create_task(_wait_and_run_llm())
-
-        else:
-            # llm_start / llm_token / llm_end / llm_error — forward as-is
-            payload = {"type": event_type}
-            if text:
-                payload["token" if event_type == "llm_token" else "text"] = text
-            await _send(payload)
-
-            # Fire TTS after LLM finishes a complete response
-            if event_type == "llm_end" and text:
-                asyncio.create_task(_run_tts(text))
+    def _start_new_turn():
+        nonlocal _turn_cancel
+        _turn_cancel = asyncio.Event()
 
     async def _send(payload: dict):
         try:
@@ -122,80 +79,135 @@ async def audio_ws(websocket: WebSocket):
         except Exception:
             pass
 
-    async def _wait_and_run_llm():
-        """
-        Sarvam VAD sends speech_end before the transcript message arrives.
-        Wait up to 500ms for the transcript to land, then fire LLM.
-        500ms > observed ~200ms gap, with headroom for slow network.
-        """
-        await asyncio.sleep(0.5)
-        if _transcript_buffer:
-            final_transcript = _transcript_buffer[-1]
-            logger.info(f"[TURN END] Transcript arrived after wait: {final_transcript!r}")
-            await _run_llm(final_transcript)
+    async def on_event(event_type: str, text: str):
+        nonlocal _transcript_buffer
+
+        if event_type == "speech_start":
+            # Sarvam VAD fired — if client_interrupt already cancelled tasks
+            # this is a no-op; if not (rare), cancel now.
+            if _active_tasks:
+                logger.info(f"[VAD INTERRUPT] Cancelling {len(_active_tasks)} task(s)")
+                _interrupt()
+                await _send({"type": "interrupted"})
+            _start_new_turn()
+            _transcript_buffer = []
+            await _send({"type": "speech_start"})
+
+        elif event_type == "transcript" and text:
+            _transcript_buffer.append(text)
+            await _send({"type": "transcript", "text": text})
+
+        elif event_type == "speech_end":
+            await _send({"type": "speech_end"})
+            if _transcript_buffer:
+                final_transcript = _transcript_buffer[-1]
+                logger.info(f"[TURN END] transcript: {final_transcript!r}")
+                _spawn(_run_llm(final_transcript, _turn_cancel))
+            else:
+                asyncio.create_task(_wait_and_run_llm())
+
         else:
-            logger.info("[TURN END] Still no transcript after 500ms wait, skipping LLM")
+            payload = {"type": event_type}
+            if text:
+                payload["token" if event_type == "llm_token" else "text"] = text
+            await _send(payload)
+            if event_type == "llm_end" and text:
+                _spawn(_run_tts(text, _turn_cancel))
 
-    async def _run_llm(transcript: str):
-        """Stream LLM response for one completed speech turn."""
-        async with llm_lock:
-            if stop_event.is_set():
-                return
+    async def _wait_and_run_llm():
+        cancel = _turn_cancel
+        await asyncio.sleep(0.5)
+        if cancel.is_set():
+            return
+        if _transcript_buffer:
+            logger.info(f"[TURN END] late transcript: {_transcript_buffer[-1]!r}")
+            _spawn(_run_llm(_transcript_buffer[-1], cancel))
+        else:
+            logger.info("[TURN END] No transcript after 500ms, skipping")
+
+    async def _run_llm(transcript: str, cancel: asyncio.Event):
+        if cancel.is_set() or stop_event.is_set():
+            return
+        try:
+            await llm_module.stream_llm_response(
+                transcript=transcript,
+                conversation_history=conversation_history,
+                event_callback=on_event,
+                cancel_event=cancel,
+            )
+        except asyncio.CancelledError:
+            logger.info("[LLM] Task cancelled")
+        except Exception as e:
+            logger.error(f"[LLM TASK ERROR] {e}")
+
+    async def _run_tts(text: str, cancel: asyncio.Event):
+        if cancel.is_set() or stop_event.is_set():
+            return
+        await _send({"type": "tts_start"})
+
+        async def on_audio_chunk(chunk: bytes):
+            if cancel.is_set() or stop_event.is_set():
+                raise asyncio.CancelledError
             try:
-                await llm_module.stream_llm_response(
-                    transcript=transcript,
-                    conversation_history=conversation_history,
-                    event_callback=on_event,
-                )
-            except Exception as e:
-                logger.error(f"[LLM TASK ERROR] {e}")
+                await websocket.send_bytes(chunk)
+            except Exception:
+                pass
 
-    async def _run_tts(text: str):
-        """Stream TTS audio for one LLM response turn."""
-        async with tts_lock:
-            if stop_event.is_set():
-                return
-
-            await _send({"type": "tts_start"})
-
-            async def on_audio_chunk(chunk: bytes):
-                if stop_event.is_set():
-                    return
-                try:
-                    await websocket.send_bytes(chunk)
-                except Exception:
-                    pass
-
-            async def on_tts_done():
+        async def on_tts_done():
+            if not cancel.is_set():
                 await _send({"type": "tts_end"})
 
-            try:
-                await tts_module.stream_tts_audio(
-                    text=text,
-                    audio_chunk_callback=on_audio_chunk,
-                    done_callback=on_tts_done,
-                )
-            except Exception as e:
-                logger.error(f"[TTS TASK ERROR] {e}")
-                await _send({"type": "tts_end"})
+        try:
+            await tts_module.stream_tts_audio(
+                text=text,
+                audio_chunk_callback=on_audio_chunk,
+                done_callback=on_tts_done,
+            )
+        except asyncio.CancelledError:
+            logger.info("[TTS] Task cancelled")
+            await _send({"type": "tts_end"})
+        except Exception as e:
+            logger.error(f"[TTS TASK ERROR] {e}")
+            await _send({"type": "tts_end"})
 
-    # Start STT background task
-    stt_task = asyncio.create_task(
-        run_streaming_stt(audio_queue, on_event, stop_event)
-    )
+    # ── client_interrupt handler ───────────────────────────────────────────
+    # Called when browser PCMProcessor detects speech energy — fires BEFORE
+    # Sarvam VAD, giving us an earlier cancellation signal.
+    async def handle_client_interrupt():
+        if _active_tasks:
+            logger.info(f"[CLIENT INTERRUPT] Energy detected — cancelling {len(_active_tasks)} task(s)")
+            _interrupt()
+            await _send({"type": "interrupted"})
+            _start_new_turn()
+            _transcript_buffer.clear()
+        # If no tasks are running, user started speaking naturally — nothing to cancel
+
+    stt_task = asyncio.create_task(run_streaming_stt(audio_queue, on_event, stop_event))
 
     try:
         while True:
-            data = await websocket.receive_bytes()
-            if data:
+            # Receive both binary (audio) and text (control) messages
+            message = await websocket.receive()
+
+            if "bytes" in message and message["bytes"]:
+                data = message["bytes"]
                 try:
                     audio_queue.put_nowait(data)
                 except asyncio.QueueFull:
+                    # Drop oldest frame, push newest — mic audio must stay current
                     try:
                         audio_queue.get_nowait()
                         audio_queue.put_nowait(data)
                     except Exception:
                         pass
+
+            elif "text" in message and message["text"]:
+                try:
+                    payload = json.loads(message["text"])
+                    if payload.get("type") == "client_interrupt":
+                        await handle_client_interrupt()
+                except Exception as e:
+                    logger.debug(f"[TEXT MSG PARSE ERROR] {e}")
 
     except WebSocketDisconnect:
         logger.info("[CLIENT DISCONNECTED]")
@@ -203,6 +215,7 @@ async def audio_ws(websocket: WebSocket):
         logger.error(f"[ERROR] {e}")
     finally:
         stop_event.set()
+        _interrupt()
         await audio_queue.put(None)
         try:
             await asyncio.wait_for(stt_task, timeout=3.0)
