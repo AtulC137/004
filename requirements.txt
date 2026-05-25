@@ -1,0 +1,5 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+sarvamai>=0.1.0
+python-dotenv==1.0.1
+websockets>=12.0
