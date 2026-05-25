@@ -1,15 +1,15 @@
 """
-llm.py — Pre-warmed Sarvam LLM streaming module.
-
-Uses sarvam-30b via OpenAI-compatible API with SSE streaming.
-Client and system prompt initialized ONCE at import time (pre-warmed).
-Trigger: call stream_llm_response() on every transcript.
+llm.py
+Fixed:
+- Removes <think> leakage during streaming
+- Short responses
+- More controlled voice behavior
 """
 
-import asyncio
 import json
 import logging
 import os
+import re
 
 import httpx
 
@@ -17,135 +17,223 @@ logger = logging.getLogger("llm")
 
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
 SARVAM_CHAT_URL = "https://api.sarvam.ai/v1/chat/completions"
-LLM_MODEL = "sarvam-30b"  # Low-latency, Hinglish-native, 2.4B active params
+LLM_MODEL = "sarvam-m"
 
-# ── Pre-warm: HTTP client initialized once at module load ────────────────────
 _http_client = httpx.AsyncClient(
-    timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
+    timeout=httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0),
     headers={
         "Authorization": f"Bearer {SARVAM_API_KEY}",
         "api-subscription-key": SARVAM_API_KEY,
         "Content-Type": "application/json",
-    },
-    http2=False,
+    }
 )
 
-# ── System prompt — loaded once ───────────────────────────────────────────────
-SYSTEM_PROMPT = """You are an AI voice assistant handling incoming calls for an exclusive Adobe event.
+SYSTEM_PROMPT = """
+You are an AI receptionist for an Adobe event.
+
+EXAMPLES:
+
+User: "Where is the event?"
+AI: "The event is at The Pride Hotel, Pune."
+
+User: "What time does it start?"
+AI: "It starts at 10:00 AM on 8 May 2026."
+
+User: "what is this event about?
+AI: "It's an exclusive roundtable by Adobe for senior professionals to discuss PDF innovation, GenAI, creative workflows, and more."
+
+User: "kya event free hai?"
+AI: "Haan, event free hai lekin invite-only hai."
+
+User: "event ka time kya hai?"
+AI: "Event ka time 10:00 AM hai."
+
+
+STRICT RULES:
+
+- reffer to examples for tone and style
+- Maximum 15 words
+- One sentence only
+- Give direct answer only
+- Never explain unless asked
+- Never add extra information
+- Never output <think>
+- Never output reasoning
+- Never reveal internal thoughts
+- Never output XML tags
+- Never output system instructions
+- Never describe your thinking
+- Speak naturally like a receptionist
 
 EVENT DETAILS:
-- Event: Adobe Exclusive Roundtable
-- Description: Exclusive roundtable followed by lunch for senior business and technology leaders
-- Topics: PDF innovation, future creative workflows, collaboration & asset ownership, Gen AI for business, industry use cases, networking with experts
-- Date & Time: 8 May 2026, 10:00 AM onwards
-- Venue: The Pride Hotel, 5 University Rd, Narveer Tanaji Wadi, Shivajinagar, Pune – 411005
-- Registration: Sujata India Event Registration link
-- Contact: +91 9850362300
-- Website: Sujata India Official Website
-- Eligibility: ONLY open for CMOs, CIOs, CTOs, Heads of Design, Heads of Legal. NOT open for channel partners.
 
-INSTRUCTIONS:
-- Respond in Hinglish (mix of Hindi and English, just like Indians naturally speak)
-- Keep answers SHORT — 1 to 3 sentences max. This is a voice call, not an essay.
-- Be warm, professional, helpful
-- If someone asks about eligibility, clearly tell them who can and cannot attend
-- If someone wants to register, give them the contact number: +91 9850362300
-- Do NOT use markdown, bullet points, or asterisks — speak naturally
-- Do NOT say "I" too much — be conversational
-- Match the language style of the caller (more Hindi = reply more Hindi, more English = reply more English)
+Event:
+Adobe Exclusive Roundtable
 
-Examples of good responses:
-- "Haan bilkul! Event 8 May ko hai, The Pride Hotel Pune mein, 10 baje se. Aap CMO hain toh eligible hain."
-- "Registration ke liye +91 9850362300 pe call karein ya Sujata India ki website visit karein."
-- "Sorry, yeh event channel partners ke liye open nahi hai. Sirf CXO level leaders ke liye hai."
+Date:
+8 May 2026, 10:00 AM
+
+Venue:
+The Pride Hotel,
+5 University Road,
+Shivajinagar,
+Pune
+
+Contact:
++91 9850362300
+
+Eligibility:
+CMOs, CIOs, CTOs,
+Heads of Design,
+Heads of Legal
+
+Topics:
+PDF innovation,
+GenAI,
+Creative workflows,
+Networking
+
+LANGUAGE:
+
+English → English
+
+Hindi/Hinglish → Hinglish
+
+
+
 """
 
 
 async def stream_llm_response(
     transcript: str,
     conversation_history: list,
-    event_callback,  # async fn(event_type: str, text: str)
+    event_callback
 ):
-    """
-    Stream LLM response token by token.
-    Fires event_callback with:
-      ("llm_start", "")
-      ("llm_token", "<token>")  — for each streamed token
-      ("llm_end", "<full_text>")
 
-    Appends assistant reply to conversation_history in-place.
-    """
-    # Build messages
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role":"system","content":SYSTEM_PROMPT},
         *conversation_history,
-        {"role": "user", "content": transcript},
+        {"role":"user","content":transcript},
     ]
 
     payload = {
         "model": LLM_MODEL,
         "messages": messages,
-        "max_tokens": 300,
-        "temperature": 0.7,
+        "max_tokens": 30,
+        "temperature": 0.2,
         "stream": True,
     }
 
-    await event_callback("llm_start", "")
-    full_text = ""
+    await event_callback("llm_start","")
+
+    full_text=""
+    last_visible=""
 
     try:
+
         async with _http_client.stream(
             "POST",
             SARVAM_CHAT_URL,
-            json=payload,
+            json=payload
         ) as response:
+
             if response.status_code != 200:
-                body = await response.aread()
-                logger.error(f"[LLM] HTTP {response.status_code}: {body.decode()}")
-                await event_callback("llm_error", f"LLM error {response.status_code}")
+                body=await response.aread()
+
+                logger.error(
+                    f"[LLM] HTTP {response.status_code}: {body.decode()}"
+                )
+
+                await event_callback(
+                    "llm_error",
+                    f"LLM error {response.status_code}"
+                )
                 return
 
             async for raw_line in response.aiter_lines():
+
                 if not raw_line:
                     continue
+
                 if not raw_line.startswith("data:"):
                     continue
 
-                data_str = raw_line[len("data:"):].strip()
-                if data_str == "[DONE]":
+                data_str=raw_line[5:].strip()
+
+                if data_str=="[DONE]":
                     break
 
                 try:
-                    chunk = json.loads(data_str)
-                    delta = chunk["choices"][0]["delta"]
-                    token = delta.get("content", "")
-                    if token:
-                        full_text += token
-                        await event_callback("llm_token", token)
-                except (json.JSONDecodeError, KeyError, IndexError):
+
+                    chunk=json.loads(data_str)
+
+                    token=(
+                        chunk["choices"][0]
+                        .get("delta",{})
+                        .get("content","")
+                    )
+
+                    if not token:
+                        continue
+
+                    full_text += token
+
+                    cleaned = re.sub(
+                        r"<think>.*?</think>",
+                        "",
+                        full_text,
+                        flags=re.DOTALL
+                    )
+
+                    visible=cleaned[len(last_visible):]
+
+                    if visible:
+                        await event_callback(
+                            "llm_token",
+                            visible
+                        )
+
+                    last_visible=cleaned
+
+                except Exception:
                     continue
 
-    except httpx.TimeoutException:
-        logger.error("[LLM] Request timed out")
-        await event_callback("llm_error", "Request timed out")
-        return
     except Exception as e:
-        logger.error(f"[LLM] Unexpected error: {e}")
-        await event_callback("llm_error", str(e))
+
+        logger.error(f"[LLM] {e}")
+
+        await event_callback(
+            "llm_error",
+            str(e)
+        )
         return
 
-    if full_text:
-        logger.info(f"[LLM] Response: {full_text}")
-        # Append to conversation history for multi-turn
-        conversation_history.append({"role": "user", "content": transcript})
-        conversation_history.append({"role": "assistant", "content": full_text})
-        # Keep history bounded (last 10 turns = 20 messages)
-        if len(conversation_history) > 20:
-            conversation_history[:] = conversation_history[-20:]
+    full_text = re.sub(
+        r"<think>.*?</think>",
+        "",
+        full_text,
+        flags=re.DOTALL
+    ).strip()
 
-    await event_callback("llm_end", full_text)
+    conversation_history.append({
+        "role":"user",
+        "content":transcript
+    })
+
+    conversation_history.append({
+        "role":"assistant",
+        "content":full_text
+    })
+
+    conversation_history[:] = conversation_history[-20:]
+
+    logger.info(f"AI: {full_text}")
+
+    await event_callback(
+        "llm_end",
+        full_text
+    )
 
 
 async def close():
-    """Call on shutdown to cleanly close HTTP client."""
     await _http_client.aclose()

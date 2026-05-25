@@ -30,6 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from stt import run_streaming_stt
 import llm as llm_module
+import tts as tts_module
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -53,6 +54,7 @@ app.add_middleware(
 @app.on_event("shutdown")
 async def shutdown():
     await llm_module.close()
+    await tts_module.close()
 
 
 @app.get("/health")
@@ -71,6 +73,7 @@ async def audio_ws(websocket: WebSocket):
     # Per-session state
     conversation_history: list = []
     llm_lock = asyncio.Lock()
+    tts_lock = asyncio.Lock()
 
     # Buffer: accumulate transcript chunks during a speech turn.
     # Reset on speech_start, finalized on speech_end.
@@ -109,6 +112,10 @@ async def audio_ws(websocket: WebSocket):
                 payload["token" if event_type == "llm_token" else "text"] = text
             await _send(payload)
 
+            # Fire TTS after LLM finishes a complete response
+            if event_type == "llm_end" and text:
+                asyncio.create_task(_run_tts(text))
+
     async def _send(payload: dict):
         try:
             await websocket.send_text(json.dumps(payload))
@@ -142,6 +149,35 @@ async def audio_ws(websocket: WebSocket):
                 )
             except Exception as e:
                 logger.error(f"[LLM TASK ERROR] {e}")
+
+    async def _run_tts(text: str):
+        """Stream TTS audio for one LLM response turn."""
+        async with tts_lock:
+            if stop_event.is_set():
+                return
+
+            await _send({"type": "tts_start"})
+
+            async def on_audio_chunk(chunk: bytes):
+                if stop_event.is_set():
+                    return
+                try:
+                    await websocket.send_bytes(chunk)
+                except Exception:
+                    pass
+
+            async def on_tts_done():
+                await _send({"type": "tts_end"})
+
+            try:
+                await tts_module.stream_tts_audio(
+                    text=text,
+                    audio_chunk_callback=on_audio_chunk,
+                    done_callback=on_tts_done,
+                )
+            except Exception as e:
+                logger.error(f"[TTS TASK ERROR] {e}")
+                await _send({"type": "tts_end"})
 
     # Start STT background task
     stt_task = asyncio.create_task(
