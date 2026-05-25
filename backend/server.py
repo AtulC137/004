@@ -34,7 +34,7 @@ import tts as tts_module
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     stream=sys.stdout,
 )
