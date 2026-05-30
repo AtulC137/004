@@ -7,6 +7,11 @@ INTERRUPT ADDITION:
   the PCMProcessor detects speech energy — BEFORE Sarvam VAD fires.
   This gives ~200-400ms earlier cancellation of LLM + TTS tasks.
 
+FIX: Removed timer-based _wait_and_run_llm (500ms sleep caused race condition
+where transcript arrived after sleep expired). Now uses a reactive _speech_ended
+flag — if transcript arrives after speech_end, LLM is triggered immediately
+with zero added latency.
+
 IMPORTANT: _active_tasks is a SET, not a list. Tasks self-remove via done_callback.
 """
 
@@ -58,6 +63,9 @@ async def audio_ws(websocket: WebSocket):
     _active_tasks: set = set()
     _turn_cancel: asyncio.Event = asyncio.Event()
 
+    # Flag: speech_end arrived but transcript hasn't yet — wait for it reactively
+    _speech_ended: bool = False
+
     def _spawn(coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
         _active_tasks.add(task)
@@ -70,8 +78,9 @@ async def audio_ws(websocket: WebSocket):
             t.cancel()
 
     def _start_new_turn():
-        nonlocal _turn_cancel
+        nonlocal _turn_cancel, _speech_ended
         _turn_cancel = asyncio.Event()
+        _speech_ended = False
 
     async def _send(payload: dict):
         try:
@@ -80,7 +89,7 @@ async def audio_ws(websocket: WebSocket):
             pass
 
     async def on_event(event_type: str, text: str):
-        nonlocal _transcript_buffer
+        nonlocal _transcript_buffer, _speech_ended
 
         if event_type == "speech_start":
             # Sarvam VAD fired — if client_interrupt already cancelled tasks
@@ -97,6 +106,12 @@ async def audio_ws(websocket: WebSocket):
             _transcript_buffer.append(text)
             await _send({"type": "transcript", "text": text})
 
+            # FIX: speech_end already fired but transcript arrived late — trigger LLM now
+            if _speech_ended and not _active_tasks:
+                _speech_ended = False
+                logger.info(f"[TURN END] late transcript (reactive): {text!r}")
+                _spawn(_run_llm(text, _turn_cancel))
+
         elif event_type == "speech_end":
             await _send({"type": "speech_end"})
             if _transcript_buffer:
@@ -104,7 +119,10 @@ async def audio_ws(websocket: WebSocket):
                 logger.info(f"[TURN END] transcript: {final_transcript!r}")
                 _spawn(_run_llm(final_transcript, _turn_cancel))
             else:
-                asyncio.create_task(_wait_and_run_llm())
+                # Transcript hasn't arrived yet — set flag, handle it reactively
+                # when the transcript event fires (no timer, no sleep, zero latency)
+                logger.info("[TURN END] Transcript not yet received, waiting reactively...")
+                _speech_ended = True
 
         else:
             payload = {"type": event_type}
@@ -113,17 +131,6 @@ async def audio_ws(websocket: WebSocket):
             await _send(payload)
             if event_type == "llm_end" and text:
                 _spawn(_run_tts(text, _turn_cancel))
-
-    async def _wait_and_run_llm():
-        cancel = _turn_cancel
-        await asyncio.sleep(0.5)
-        if cancel.is_set():
-            return
-        if _transcript_buffer:
-            logger.info(f"[TURN END] late transcript: {_transcript_buffer[-1]!r}")
-            _spawn(_run_llm(_transcript_buffer[-1], cancel))
-        else:
-            logger.info("[TURN END] No transcript after 500ms, skipping")
 
     async def _run_llm(transcript: str, cancel: asyncio.Event):
         if cancel.is_set() or stop_event.is_set():
