@@ -1,16 +1,16 @@
 """
-server.py — interrupt handling with correct set-based task tracking.
+server.py — greeting + farewell + reactive transcript fix + interrupt handling.
 
-INTERRUPT ADDITION:
-  Handles both binary (audio) and text (JSON control) WebSocket messages.
-  Accepts { type: 'client_interrupt' } from the browser, which fires when
-  the PCMProcessor detects speech energy — BEFORE Sarvam VAD fires.
-  This gives ~200-400ms earlier cancellation of LLM + TTS tasks.
+CHANGES:
+  - Greeting TTS plays immediately on connect (interruptible — user can speak over it)
+  - Farewell detection: if user says bye/thanks/done, AI responds then closes WebSocket
+  - _is_farewell flag: protects bye TTS from being cancelled mid-sentence
+  - Reactive _speech_ended flag: no timer-based wait for transcript (zero latency fix)
 
-FIX: Removed timer-based _wait_and_run_llm (500ms sleep caused race condition
-where transcript arrived after sleep expired). Now uses a reactive _speech_ended
-flag — if transcript arrives after speech_end, LLM is triggered immediately
-with zero added latency.
+INTERRUPT BEHAVIOUR:
+  - During greeting TTS   → interrupted immediately, user starts speaking
+  - During normal AI TTS  → interrupted immediately, user starts speaking
+  - During farewell TTS   → NOT interrupted (_is_farewell=True), let it finish cleanly
 
 IMPORTANT: _active_tasks is a SET, not a list. Tasks self-remove via done_callback.
 """
@@ -36,6 +36,10 @@ logger = logging.getLogger("server")
 
 app = FastAPI(title="Voice Event Assistant")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+GREETING = "Hi! I'm Aria, your Adobe event assistant. Feel free to ask me anything about the event!"
+
+FAREWELL_WORDS = {"bye", "goodbye", "thank you", "thanks", "that's all", "thats all", "done", "ok bye", "okay bye"}
 
 
 @app.on_event("shutdown")
@@ -66,6 +70,9 @@ async def audio_ws(websocket: WebSocket):
     # Flag: speech_end arrived but transcript hasn't yet — wait for it reactively
     _speech_ended: bool = False
 
+    # Flag: farewell TTS is playing — do NOT cancel it on interrupt
+    _is_farewell: bool = False
+
     def _spawn(coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
         _active_tasks.add(task)
@@ -73,6 +80,8 @@ async def audio_ws(websocket: WebSocket):
         return task
 
     def _interrupt():
+        if _is_farewell:
+            return  # Never cancel farewell TTS — let it finish
         _turn_cancel.set()
         for t in list(_active_tasks):
             t.cancel()
@@ -88,13 +97,19 @@ async def audio_ws(websocket: WebSocket):
         except Exception:
             pass
 
+    def _is_farewell_transcript(text: str) -> bool:
+        text_lower = text.lower().strip().rstrip(".,!?")
+        return any(fw in text_lower for fw in FAREWELL_WORDS)
+
     async def on_event(event_type: str, text: str):
-        nonlocal _transcript_buffer, _speech_ended
+        nonlocal _transcript_buffer, _speech_ended, _is_farewell
 
         if event_type == "speech_start":
-            # Sarvam VAD fired — if client_interrupt already cancelled tasks
-            # this is a no-op; if not (rare), cancel now.
+            # Sarvam VAD fired — cancel active tasks unless farewell is playing
             if _active_tasks:
+                if _is_farewell:
+                    logger.info("[VAD INTERRUPT] Farewell in progress — ignoring interrupt")
+                    return
                 logger.info(f"[VAD INTERRUPT] Cancelling {len(_active_tasks)} task(s)")
                 _interrupt()
                 await _send({"type": "interrupted"})
@@ -106,7 +121,7 @@ async def audio_ws(websocket: WebSocket):
             _transcript_buffer.append(text)
             await _send({"type": "transcript", "text": text})
 
-            # FIX: speech_end already fired but transcript arrived late — trigger LLM now
+            # speech_end already fired but transcript arrived late — trigger LLM now
             if _speech_ended and not _active_tasks:
                 _speech_ended = False
                 logger.info(f"[TURN END] late transcript (reactive): {text!r}")
@@ -119,8 +134,6 @@ async def audio_ws(websocket: WebSocket):
                 logger.info(f"[TURN END] transcript: {final_transcript!r}")
                 _spawn(_run_llm(final_transcript, _turn_cancel))
             else:
-                # Transcript hasn't arrived yet — set flag, handle it reactively
-                # when the transcript event fires (no timer, no sleep, zero latency)
                 logger.info("[TURN END] Transcript not yet received, waiting reactively...")
                 _speech_ended = True
 
@@ -129,8 +142,16 @@ async def audio_ws(websocket: WebSocket):
             if text:
                 payload["token" if event_type == "llm_token" else "text"] = text
             await _send(payload)
+
             if event_type == "llm_end" and text:
-                _spawn(_run_tts(text, _turn_cancel))
+                # Check if the last user utterance was a farewell
+                last_user_text = _transcript_buffer[-1] if _transcript_buffer else ""
+                if _is_farewell_transcript(last_user_text):
+                    logger.info("[FAREWELL] Detected — playing bye TTS then closing")
+                    _is_farewell = True
+                    _spawn(_run_farewell_tts(text, _turn_cancel))
+                else:
+                    _spawn(_run_tts(text, _turn_cancel))
 
     async def _run_llm(transcript: str, cancel: asyncio.Event):
         if cancel.is_set() or stop_event.is_set():
@@ -177,23 +198,59 @@ async def audio_ws(websocket: WebSocket):
             logger.error(f"[TTS TASK ERROR] {e}")
             await _send({"type": "tts_end"})
 
+    async def _run_farewell_tts(text: str, cancel: asyncio.Event):
+        """TTS for farewell — not cancellable. Closes WebSocket after playing."""
+        if stop_event.is_set():
+            return
+        await _send({"type": "tts_start"})
+
+        async def on_audio_chunk(chunk: bytes):
+            # No cancel check — farewell plays to completion
+            try:
+                await websocket.send_bytes(chunk)
+            except Exception:
+                pass
+
+        async def on_tts_done():
+            await _send({"type": "tts_end"})
+
+        try:
+            await tts_module.stream_tts_audio(
+                text=text,
+                audio_chunk_callback=on_audio_chunk,
+                done_callback=on_tts_done,
+            )
+        except Exception as e:
+            logger.error(f"[FAREWELL TTS ERROR] {e}")
+            await _send({"type": "tts_end"})
+
+        logger.info("[FAREWELL] TTS complete — closing WebSocket")
+        stop_event.set()
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
     # ── client_interrupt handler ───────────────────────────────────────────
-    # Called when browser PCMProcessor detects speech energy — fires BEFORE
-    # Sarvam VAD, giving us an earlier cancellation signal.
     async def handle_client_interrupt():
+        if _is_farewell:
+            logger.info("[CLIENT INTERRUPT] Farewell in progress — ignoring")
+            return
         if _active_tasks:
             logger.info(f"[CLIENT INTERRUPT] Energy detected — cancelling {len(_active_tasks)} task(s)")
             _interrupt()
             await _send({"type": "interrupted"})
             _start_new_turn()
             _transcript_buffer.clear()
-        # If no tasks are running, user started speaking naturally — nothing to cancel
 
     stt_task = asyncio.create_task(run_streaming_stt(audio_queue, on_event, stop_event))
 
+    # ── Play greeting immediately on connect ──────────────────────────────
+    logger.info("[GREETING] Playing opening greeting")
+    _spawn(_run_tts(GREETING, _turn_cancel))
+
     try:
         while True:
-            # Receive both binary (audio) and text (control) messages
             message = await websocket.receive()
 
             if "bytes" in message and message["bytes"]:
@@ -201,7 +258,6 @@ async def audio_ws(websocket: WebSocket):
                 try:
                     audio_queue.put_nowait(data)
                 except asyncio.QueueFull:
-                    # Drop oldest frame, push newest — mic audio must stay current
                     try:
                         audio_queue.get_nowait()
                         audio_queue.put_nowait(data)

@@ -19,7 +19,7 @@ logger = logging.getLogger("llm")
 
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
 SARVAM_CHAT_URL = "https://api.sarvam.ai/v1/chat/completions"
-LLM_MODEL = "sarvam-m"
+LLM_MODEL = "sarvam-30b"
 
 _http_client = httpx.AsyncClient(
     timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
@@ -31,8 +31,7 @@ _http_client = httpx.AsyncClient(
 )
 
 SYSTEM_PROMPT = """You are a voice receptionist for an Adobe event. Answer immediately and briefly.
-ONE sentence only. Maximum 20 words. No thinking. No explanation. Just the answer.
-
+ONE sentence only. Maximum 20 words. No thinking. No explanation. Just the answer. if user questions in english reply in english, if in hindi reply in hindi. if he questions in Hinglish then reply in Hinglish. If you don't know the answer, say "Sorry, I don't have that information." Here is the event info:
 User: "Where is the event?" → "The Pride Hotel, 5 University Road, Shivajinagar, Pune."
 User: "What time?" → "10:00 AM on 8 May 2026."
 User: "What is this about?" → "Adobe roundtable on PDF innovation, GenAI, and creative workflows."
@@ -40,6 +39,7 @@ User: "Tell me in detail." → "Adobe roundtable on 8 May at The Pride Hotel, Pu
 User: "Who can attend?" → "CMOs, CIOs, CTOs, Heads of Design and Legal."
 User: "kya event free hai?" → "Haan, free hai lekin invite-only hai."
 User: "contact?" → "+91 9850362300."
+User: "bye" / "thank you" / "thanks" / "that's all" → "Thank you for your interest! Hope to see you at the event. Goodbye!"
 
 EVENT: Adobe Exclusive Roundtable | 8 May 2026 10:00 AM | The Pride Hotel, 5 University Road, Shivajinagar, Pune | +91 9850362300 | Eligible: CMOs CIOs CTOs Heads of Design/Legal | Topics: PDF innovation GenAI Creative workflows Networking"""
 
@@ -64,9 +64,10 @@ async def stream_llm_response(
     payload = {
         "model": LLM_MODEL,
         "messages": messages,
-        "max_tokens": 2048,   # enough for think block + answer
+        "max_tokens": 120,   # enough for think block + answer
         "temperature": 0.2,
         "stream": True,
+        "reasoning_effort": None
     }
 
     await event_callback("llm_start", "")
