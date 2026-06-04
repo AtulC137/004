@@ -13,6 +13,7 @@ Full list: https://dashboard.sarvam.ai/text-to-speech
 
 import logging
 import os
+import re
 
 import httpx
 
@@ -23,7 +24,7 @@ SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
 # ── Voice & model config ──────────────────────────────────────────────────────
 # bulbul:v3 — best quality, 30+ voices, Hinglish native
 TTS_MODEL   = "bulbul:v3"
-TTS_SPEAKER = "ritu"        # Warm female voice, natural for Hinglish
+TTS_SPEAKER = "ritu"        # Voice only (Bulbul speaker). Agent name is Susha — not spoken as "Ritu".
                                # Alternatives: "shubh", "vidya", "arjun", "meera"
 
 TTS_STREAM_URL = "https://api.sarvam.ai/text-to-speech/stream"
@@ -40,10 +41,19 @@ _http_client = httpx.AsyncClient(
 )
 
 
+def tts_language_for_text(text: str) -> str:
+    if re.search(r"[\u0900-\u097F]", text):
+        return "hi-IN"
+    if re.search(r"\b(kya|kahan|kab|hai|hain|mein|hoga|hogi|nahi|haan|subah|shaam)\b", text, re.I):
+        return "hi-IN"
+    return "en-IN"
+
+
 async def stream_tts_audio(
     text: str,
     audio_chunk_callback,  # async fn(chunk: bytes) — called for each audio chunk
     done_callback,         # async fn() — called when stream is complete
+    target_language_code: str | None = None,
 ):
     """
     Stream TTS audio chunk by chunk from Sarvam AI.
@@ -64,15 +74,17 @@ async def stream_tts_audio(
         await done_callback()
         return
 
+    lang = target_language_code or tts_language_for_text(text)
+
     payload = {
         "text": text,
         "model": TTS_MODEL,
         "speaker": TTS_SPEAKER,
-        "target_language_code": "hi-IN",   # Hinglish — Hindi script + English words
-        "output_audio_codec": "mp3",        # Raw MP3 stream (frontend decodes it)
-        "output_audio_bitrate": "128k",     # Good quality, matches previous ElevenLabs output
-        "pace": 1.0,                        # 0.5–2.0; 1.0 = natural speed
-        "enable_preprocessing": True,       # Normalises English words/numbers in Hinglish
+        "target_language_code": lang,
+        "output_audio_codec": "mp3",
+        "output_audio_bitrate": "64k",
+        "pace": 1.0,
+        "enable_preprocessing": lang == "hi-IN",
     }
 
     try:
@@ -87,7 +99,7 @@ async def stream_tts_audio(
                 await done_callback()
                 return
 
-            logger.info(f"[TTS] Streaming audio for: {text[:60]}...")
+            logger.info(f"[TTS] Streaming audio [{lang}] for: {text[:60]}...")
             chunk_count = 0
 
             async for chunk in response.aiter_bytes(chunk_size=4096):

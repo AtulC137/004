@@ -37,9 +37,13 @@ logger = logging.getLogger("server")
 app = FastAPI(title="Voice Event Assistant")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-GREETING = "Hi! I'm Aria, your Adobe event assistant. Feel free to ask me anything about the event!"
+GREETING = "Hi! I'm Susha, your Adobe event assistant. Feel free to ask me anything about the event!"
 
-FAREWELL_WORDS = {"bye", "goodbye", "thank you", "thanks", "that's all", "thats all", "done", "ok bye", "okay bye"}
+FAREWELL_WORDS = {
+    "bye", "goodbye", "thank you", "thanks", "that's all", "thats all", "done", "ok bye", "okay bye",
+    "chalo bye", "chalo", "alvida", "see you",
+    "बाय", "बाइ", "धन्यवाद", "अलविदा", "ठीक है बाय",
+}
 
 
 @app.on_event("shutdown")
@@ -73,6 +77,9 @@ async def audio_ws(websocket: WebSocket):
     # Flag: farewell TTS is playing — do NOT cancel it on interrupt
     _is_farewell: bool = False
 
+    _turn_stt_lang: str | None = None
+    _last_lang: str | None = None
+
     def _spawn(coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
         _active_tasks.add(task)
@@ -98,26 +105,32 @@ async def audio_ws(websocket: WebSocket):
             pass
 
     def _is_farewell_transcript(text: str) -> bool:
-        text_lower = text.lower().strip().rstrip(".,!?")
-        return any(fw in text_lower for fw in FAREWELL_WORDS)
+        text_norm = text.strip().rstrip(".,!?")
+        text_lower = text_norm.lower()
+        return any(fw in text_lower or fw in text_norm for fw in FAREWELL_WORDS)
 
-    async def on_event(event_type: str, text: str):
-        nonlocal _transcript_buffer, _speech_ended, _is_farewell
+    async def on_event(event_type: str, text: str, stt_lang: str | None = None, response_lang: str | None = None):
+        nonlocal _transcript_buffer, _speech_ended, _is_farewell, _turn_stt_lang
 
         if event_type == "speech_start":
-            # Sarvam VAD fired — cancel active tasks unless farewell is playing
+            if _is_farewell:
+                logger.info("[VAD] Farewell in progress — ignoring speech_start")
+                return
+            # Sarvam VAD fired — cancel active tasks
             if _active_tasks:
-                if _is_farewell:
-                    logger.info("[VAD INTERRUPT] Farewell in progress — ignoring interrupt")
-                    return
                 logger.info(f"[VAD INTERRUPT] Cancelling {len(_active_tasks)} task(s)")
                 _interrupt()
                 await _send({"type": "interrupted"})
             _start_new_turn()
             _transcript_buffer = []
+            _turn_stt_lang = None
             await _send({"type": "speech_start"})
 
         elif event_type == "transcript" and text:
+            if _is_farewell:
+                return
+            if stt_lang:
+                _turn_stt_lang = stt_lang
             _transcript_buffer.append(text)
             await _send({"type": "transcript", "text": text})
 
@@ -125,14 +138,16 @@ async def audio_ws(websocket: WebSocket):
             if _speech_ended and not _active_tasks:
                 _speech_ended = False
                 logger.info(f"[TURN END] late transcript (reactive): {text!r}")
-                _spawn(_run_llm(text, _turn_cancel))
+                _spawn(_run_llm(text, _turn_cancel, _turn_stt_lang))
 
         elif event_type == "speech_end":
+            if _is_farewell:
+                return
             await _send({"type": "speech_end"})
             if _transcript_buffer:
                 final_transcript = _transcript_buffer[-1]
                 logger.info(f"[TURN END] transcript: {final_transcript!r}")
-                _spawn(_run_llm(final_transcript, _turn_cancel))
+                _spawn(_run_llm(final_transcript, _turn_cancel, _turn_stt_lang))
             else:
                 logger.info("[TURN END] Transcript not yet received, waiting reactively...")
                 _speech_ended = True
@@ -146,29 +161,40 @@ async def audio_ws(websocket: WebSocket):
             if event_type == "llm_end" and text:
                 # Check if the last user utterance was a farewell
                 last_user_text = _transcript_buffer[-1] if _transcript_buffer else ""
+                tts_lang = llm_module.tts_code_for_language(response_lang or _last_lang or "english")
                 if _is_farewell_transcript(last_user_text):
                     logger.info("[FAREWELL] Detected — playing bye TTS then closing")
                     _is_farewell = True
-                    _spawn(_run_farewell_tts(text, _turn_cancel))
+                    await _send({"type": "farewell_start"})
+                    _spawn(_run_farewell_tts(text, _turn_cancel, tts_lang))
                 else:
-                    _spawn(_run_tts(text, _turn_cancel))
+                    _spawn(_run_tts(text, _turn_cancel, tts_lang))
 
-    async def _run_llm(transcript: str, cancel: asyncio.Event):
+    async def _run_llm(transcript: str, cancel: asyncio.Event, stt_lang: str | None = None):
+        nonlocal _last_lang
         if cancel.is_set() or stop_event.is_set():
             return
+
+        lang = llm_module.resolve_response_language(stt_lang, transcript)
+        if _last_lang is not None and lang != _last_lang:
+            logger.info(f"[LLM] Language switch {_last_lang} → {lang}, clearing history")
+            conversation_history.clear()
+        _last_lang = lang
+
         try:
             await llm_module.stream_llm_response(
                 transcript=transcript,
                 conversation_history=conversation_history,
                 event_callback=on_event,
                 cancel_event=cancel,
+                stt_lang=stt_lang,
             )
         except asyncio.CancelledError:
             logger.info("[LLM] Task cancelled")
         except Exception as e:
             logger.error(f"[LLM TASK ERROR] {e}")
 
-    async def _run_tts(text: str, cancel: asyncio.Event):
+    async def _run_tts(text: str, cancel: asyncio.Event, tts_lang: str = "en-IN"):
         if cancel.is_set() or stop_event.is_set():
             return
         await _send({"type": "tts_start"})
@@ -190,6 +216,7 @@ async def audio_ws(websocket: WebSocket):
                 text=text,
                 audio_chunk_callback=on_audio_chunk,
                 done_callback=on_tts_done,
+                target_language_code=tts_lang,
             )
         except asyncio.CancelledError:
             logger.info("[TTS] Task cancelled")
@@ -198,7 +225,7 @@ async def audio_ws(websocket: WebSocket):
             logger.error(f"[TTS TASK ERROR] {e}")
             await _send({"type": "tts_end"})
 
-    async def _run_farewell_tts(text: str, cancel: asyncio.Event):
+    async def _run_farewell_tts(text: str, cancel: asyncio.Event, tts_lang: str = "en-IN"):
         """TTS for farewell — not cancellable. Closes WebSocket after playing."""
         if stop_event.is_set():
             return
@@ -219,13 +246,16 @@ async def audio_ws(websocket: WebSocket):
                 text=text,
                 audio_chunk_callback=on_audio_chunk,
                 done_callback=on_tts_done,
+                target_language_code=tts_lang,
             )
         except Exception as e:
             logger.error(f"[FAREWELL TTS ERROR] {e}")
             await _send({"type": "tts_end"})
 
         logger.info("[FAREWELL] TTS complete — closing WebSocket")
+        await _send({"type": "session_end"})
         stop_event.set()
+        await asyncio.sleep(0.5)
         try:
             await websocket.close()
         except Exception:
@@ -247,13 +277,15 @@ async def audio_ws(websocket: WebSocket):
 
     # ── Play greeting immediately on connect ──────────────────────────────
     logger.info("[GREETING] Playing opening greeting")
-    _spawn(_run_tts(GREETING, _turn_cancel))
+    _spawn(_run_tts(GREETING, _turn_cancel, "en-IN"))
 
     try:
         while True:
             message = await websocket.receive()
 
             if "bytes" in message and message["bytes"]:
+                if _is_farewell:
+                    continue
                 data = message["bytes"]
                 try:
                     audio_queue.put_nowait(data)

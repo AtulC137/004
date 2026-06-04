@@ -330,6 +330,11 @@
   let ttsChunkBuffer   = [];        // Raw MP3 byte accumulator (Uint8Array[])
   let ttsPlaying       = false;
   let ttsScheduled     = [];        // All live AudioBufferSourceNodes — for stop()
+  let ttsSessionId     = 0;
+  let activeTtsSession = 0;
+  let farewellMode           = false;
+  let micSending             = true;
+  let farewellCleanupScheduled = false;
 
   // Minimum bytes before we attempt MP3 decode.
   // MP3 needs complete frames; too small = decode error.
@@ -344,21 +349,36 @@
     return ttsAudioCtx;
   }
 
+  function invalidateTtsSession() {
+    activeTtsSession = 0;
+  }
+
   // Called on interrupt — stops ALL scheduled audio nodes immediately.
-  // This is the key function that makes interrupts feel instant.
   function stopTtsNow() {
-    ttsPlaying    = false;
+    ttsPlaying     = false;
     ttsChunkBuffer = [];
-    // stop(0) works on nodes that haven't started yet — kills pre-buffered future audio
     ttsScheduled.forEach(src => {
       try { src.stop(0); } catch (_) {}
     });
     ttsScheduled  = [];
     ttsNextPlayAt = 0;
+    if (ttsAudioCtx && ttsAudioCtx.state !== 'closed') {
+      ttsAudioCtx.close().catch(() => {});
+      ttsAudioCtx = null;
+    }
   }
 
-  async function enqueueTtsChunk(arrayBuffer) {
-    if (!ttsPlaying) return; // already interrupted — drop incoming chunk
+  function beginTtsSession() {
+    stopTtsNow();
+    activeTtsSession = ++ttsSessionId;
+    ttsPlaying       = true;
+    ttsChunkBuffer   = [];
+    const ctx        = getTtsAudioCtx();
+    ttsNextPlayAt    = ctx.currentTime;
+  }
+
+  async function enqueueTtsChunk(arrayBuffer, sessionId) {
+    if (!ttsPlaying || sessionId !== activeTtsSession) return;
     ttsChunkBuffer.push(new Uint8Array(arrayBuffer));
     const totalBytes = ttsChunkBuffer.reduce((s, c) => s + c.length, 0);
     if (totalBytes >= TTS_DECODE_THRESHOLD) {
@@ -367,9 +387,9 @@
   }
 
   async function flushTtsBuffer() {
+    const session = activeTtsSession;
     if (ttsChunkBuffer.length === 0) return;
 
-    // Merge all buffered chunks
     const totalBytes = ttsChunkBuffer.reduce((s, c) => s + c.length, 0);
     const merged     = new Uint8Array(totalBytes);
     let offset       = 0;
@@ -379,42 +399,89 @@
     }
     ttsChunkBuffer = [];
 
-    // Guard: if interrupted while we were accumulating, drop this batch
-    if (!ttsPlaying) return;
+    if (session !== activeTtsSession || !ttsPlaying) return;
 
     try {
       const ctx = getTtsAudioCtx();
       const audioBuffer = await ctx.decodeAudioData(merged.buffer);
 
-      // Guard again: interrupt may have fired during async decode
-      if (!ttsPlaying) return;
+      if (session !== activeTtsSession || !ttsPlaying) return;
 
       const src = ctx.createBufferSource();
       src.buffer = audioBuffer;
       src.connect(ctx.destination);
 
-      // Self-remove from tracked list when node finishes naturally
       src.onended = () => {
         ttsScheduled = ttsScheduled.filter(s => s !== src);
       };
 
-      // Schedule gapless — start exactly when previous chunk ends
       const now   = ctx.currentTime;
-      const start = Math.max(now + 0.05, ttsNextPlayAt); // 50ms scheduling headroom
+      const start = Math.max(now + 0.05, ttsNextPlayAt);
       src.start(start);
       ttsNextPlayAt = start + audioBuffer.duration;
 
-      // Track node so stopTtsNow() can kill it
       ttsScheduled.push(src);
 
     } catch (err) {
-      // Partial MP3 frames fail decode — silently drop
       console.warn('[TTS] Decode error (partial frame?):', err.message);
     }
   }
 
   function resetTtsEngine() {
     stopTtsNow();
+    invalidateTtsSession();
+  }
+
+  function stopMicAndWs() {
+    if (animFrameId) { cancelAnimationFrame(animFrameId); animFrameId = null; }
+    if (workletNode) { workletNode.disconnect(); workletNode = null; }
+    if (sourceNode)  { sourceNode.disconnect(); sourceNode = null; }
+    analyser = null;
+    if (audioCtx)    { audioCtx.close(); audioCtx = null; }
+    if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+    ws = null;
+  }
+
+  function waitForTtsPlaybackThenCleanup() {
+    if (farewellCleanupScheduled) return;
+    farewellCleanupScheduled = true;
+
+    function finish() {
+      if (ttsAudioCtx && ttsAudioCtx.state !== 'closed') {
+        ttsAudioCtx.close().catch(() => {});
+        ttsAudioCtx = null;
+      }
+      resetTtsEngine();
+      farewellMode = false;
+      micSending = false;
+      stopMicAndWs();
+      finalizeAiTurn('');
+      startBtn.disabled = false;
+      stopBtn.disabled  = true;
+      setStatus('', 'Disconnected');
+      drawIdle();
+    }
+
+    const ctx = ttsAudioCtx;
+    if (!ctx || ctx.state === 'closed') {
+      finish();
+      return;
+    }
+
+    const remainingMs = Math.max(0, (ttsNextPlayAt - ctx.currentTime) * 1000) + 300;
+    setTimeout(() => {
+      if (ttsScheduled.length === 0) {
+        finish();
+        return;
+      }
+      const deadline = Date.now() + remainingMs + 3000;
+      const check = setInterval(() => {
+        if (ttsScheduled.length === 0 || Date.now() >= deadline) {
+          clearInterval(check);
+          finish();
+        }
+      }, 100);
+    }, remainingMs);
   }
 
   // ── Canvas visualizer ──────────────────────────────────────────────────
@@ -543,7 +610,7 @@
 
     // Binary frame = TTS audio chunk
     if (evt.data instanceof ArrayBuffer) {
-      if (ttsPlaying) enqueueTtsChunk(evt.data);
+      if (ttsPlaying) enqueueTtsChunk(evt.data, activeTtsSession);
       return;
     }
 
@@ -556,13 +623,18 @@
       // Server confirms cancellation of LLM+TTS tasks.
       // Stop all audio immediately — this is the core of interrupt handling.
       case 'interrupted':
-        stopTtsNow();                             // kill all scheduled audio nodes NOW
-        markAiTurnInterrupted();                  // dim the partial AI text in UI
+        if (farewellMode) break;
+        stopTtsNow();
+        invalidateTtsSession();
+        markAiTurnInterrupted();
         setStatus('interrupted', 'Interrupted · Listening...');
         addTranscriptLine('t-event', '── interrupted');
         break;
 
       case 'speech_start':
+        if (farewellMode) break;
+        stopTtsNow();
+        invalidateTtsSession();
         setStatus('speech', 'Listening · Speech detected');
         addTranscriptLine('t-event', '── speech detected');
         break;
@@ -577,6 +649,9 @@
         break;
 
       case 'llm_start':
+        if (farewellMode) break;
+        stopTtsNow();
+        invalidateTtsSession();
         setStatus('thinking', 'AI thinking...');
         startAiTurn();
         break;
@@ -599,20 +674,36 @@
         }
         break;
 
+      case 'farewell_start':
+        farewellMode = true;
+        micSending = false;
+        setStatus('speaking', 'Goodbye...');
+        addTranscriptLine('t-event', '── goodbye');
+        break;
+
+      case 'session_end':
+        micSending = false;
+        if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+        break;
+
       case 'tts_start':
-        ttsPlaying     = true;
-        ttsChunkBuffer = [];
-        ttsScheduled   = [];
-        if (ttsAudioCtx) ttsNextPlayAt = ttsAudioCtx.currentTime;
-        setStatus('speaking', 'AI speaking...');
+        beginTtsSession();
+        setStatus('speaking', farewellMode ? 'Goodbye...' : 'AI speaking...');
         break;
 
       case 'tts_end':
-        // Flush any remaining buffered bytes, then mark done
-        flushTtsBuffer().then(() => {
-          ttsPlaying = false;
-          setStatus('listening', 'Listening · Speak now');
-        });
+        {
+          const endSession = activeTtsSession;
+          flushTtsBuffer().then(() => {
+            if (endSession !== activeTtsSession) return;
+            if (farewellMode) {
+              waitForTtsPlaybackThenCleanup();
+            } else {
+              ttsPlaying = false;
+              setStatus('listening', 'Listening · Speak now');
+            }
+          });
+        }
         break;
     }
   }
@@ -624,13 +715,23 @@
     setStatus('', 'Connecting...');
 
     try {
+      farewellMode = false;
+      micSending = true;
+      farewellCleanupScheduled = false;
       ws = new WebSocket(WS_URL);
       ws.binaryType = 'arraybuffer';
 
       ws.onopen    = () => { setStatus('connected', 'Connected · Starting mic...'); startMic(); };
       ws.onmessage = handleMessage;
-      ws.onerror   = () => { setStatus('error', 'WebSocket error'); addTranscriptLine('t-error', 'WebSocket error'); cleanup(); };
-      ws.onclose   = () => { if (!stopBtn.disabled) setStatus('', 'Disconnected'); cleanup(); };
+      ws.onerror   = () => { setStatus('error', 'WebSocket error'); addTranscriptLine('t-error', 'WebSocket error'); if (!farewellMode) cleanup(); else waitForTtsPlaybackThenCleanup(); };
+      ws.onclose   = () => {
+        if (farewellMode) {
+          waitForTtsPlaybackThenCleanup();
+        } else {
+          if (!stopBtn.disabled) setStatus('', 'Disconnected');
+          cleanup();
+        }
+      };
 
     } catch (err) {
       setStatus('error', 'Failed: ' + err.message);
@@ -683,12 +784,16 @@
         // This fires BEFORE Sarvam VAD — gives ~200-400ms earlier interrupt.
         // Only send to server if AI is currently active (TTS playing or LLM running).
         if (e.data && e.data.type === 'speech_energy_detected') {
+          if (farewellMode) return;
           if (ttsPlaying && ws && ws.readyState === WebSocket.OPEN) {
-            stopTtsNow();   // stop local audio immediately — don't wait for server round-trip
+            stopTtsNow();
+            invalidateTtsSession();
             ws.send(JSON.stringify({ type: 'client_interrupt' }));
           }
           return;
         }
+
+        if (!micSending) return;
 
         // PCM audio chunk → send to server for STT
         if (ws && ws.readyState === WebSocket.OPEN) {
@@ -712,14 +817,12 @@
   }
 
   function cleanup() {
-    if (animFrameId) { cancelAnimationFrame(animFrameId); animFrameId = null; }
-    if (workletNode) { workletNode.disconnect(); workletNode = null; }
-    if (sourceNode)  { sourceNode.disconnect(); sourceNode = null; }
-    analyser = null;
-    if (audioCtx)    { audioCtx.close(); audioCtx = null; }
-    if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+    farewellMode = false;
+    micSending = false;
+    farewellCleanupScheduled = false;
+    stopMicAndWs();
     if (ws && ws.readyState === WebSocket.OPEN) { ws.close(); ws = null; }
-    if (ttsAudioCtx) { ttsAudioCtx.close(); ttsAudioCtx = null; }
+    if (ttsAudioCtx) { ttsAudioCtx.close().catch(() => {}); ttsAudioCtx = null; }
     resetTtsEngine();
     finalizeAiTurn('');
   }

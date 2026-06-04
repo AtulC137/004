@@ -16,7 +16,8 @@ from sarvamai import AsyncSarvamAI
 logger = logging.getLogger("stt")
 
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
-SEND_CHUNK_BYTES = 8192
+#SEND_CHUNK_BYTES = 8192
+SEND_CHUNK_BYTES = 4096
 
 
 async def run_streaming_stt(
@@ -29,7 +30,7 @@ async def run_streaming_stt(
     async with client.speech_to_text_streaming.connect(
         model="saaras:v3",
         mode="transcribe",
-        language_code="en-IN",
+        language_code="unknown",
         sample_rate=16000,
         input_audio_codec="pcm_s16le",
         high_vad_sensitivity=False,
@@ -87,8 +88,12 @@ async def run_streaming_stt(
                 elif msg_type == "data" and data is not None:
                     transcript = getattr(data, "transcript", "") or ""
                     if transcript:
-                        logger.info(f"USER: {transcript}")
-                        await event_callback("transcript", transcript)
+                        detected_lang = getattr(data, "language_code", None)
+                        if detected_lang:
+                            logger.info(f"USER [{detected_lang}]: {transcript}")
+                        else:
+                            logger.info(f"USER: {transcript}")
+                        await event_callback("transcript", transcript, detected_lang)
 
                 else:
                     logger.debug(f"[SARVAM UNKNOWN] {msg}")
