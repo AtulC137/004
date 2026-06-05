@@ -331,7 +331,6 @@
   let greetingMode           = false;
   let micSending             = false;
   let farewellCleanupScheduled = false;
-  let greetingTimeoutId      = null;
 
   function getTtsAudioCtx() {
     if (!ttsAudioCtx || ttsAudioCtx.state === 'closed') {
@@ -609,21 +608,10 @@
         micSending = false;
         setStatus('speaking', 'Susha introducing...');
         if (msg.text) addTranscriptLine('t-ai', msg.text);
-        if (greetingTimeoutId) clearTimeout(greetingTimeoutId);
-        greetingTimeoutId = setTimeout(() => {
-          if (greetingMode) {
-            greetingMode = false;
-            micSending = true;
-            setStatus('listening', 'Listening · Speak now');
-          }
-        }, 8000);
         break;
 
       case 'greeting_end':
-        greetingMode = false;
-        micSending = true;
-        if (greetingTimeoutId) { clearTimeout(greetingTimeoutId); greetingTimeoutId = null; }
-        setStatus('listening', 'Listening · Speak now');
+        // mic + greetingMode stay locked until tts_end playback completes
         break;
 
       case 'speech_start':
@@ -703,6 +691,10 @@
               waitForTtsPlaybackThenCleanup();
             } else {
               ttsPlaying = false;
+              if (greetingMode) {
+                greetingMode = false;
+                micSending = true;
+              }
               setStatus('listening', 'Listening · Speak now');
             }
           }, remainingMs);
@@ -722,7 +714,6 @@
       greetingMode = false;
       micSending = false;
       farewellCleanupScheduled = false;
-      if (greetingTimeoutId) { clearTimeout(greetingTimeoutId); greetingTimeoutId = null; }
       ws = new WebSocket(WS_URL);
       ws.binaryType = 'arraybuffer';
 
@@ -826,7 +817,6 @@
     farewellMode = false;
     greetingMode = false;
     micSending = false;
-    if (greetingTimeoutId) { clearTimeout(greetingTimeoutId); greetingTimeoutId = null; }
     farewellCleanupScheduled = false;
     stopMicAndWs();
     if (ws && ws.readyState === WebSocket.OPEN) { ws.close(); ws = null; }

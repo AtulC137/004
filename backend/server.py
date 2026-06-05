@@ -96,6 +96,20 @@ async def audio_ws(websocket: WebSocket):
             tts_session.prewarm(lang, after_abort=after_abort)
         )
 
+    async def _cancel_prewarm_task():
+        nonlocal _prewarm_task
+        if _prewarm_task and not _prewarm_task.done():
+            _prewarm_task.cancel()
+            try:
+                await _prewarm_task
+            except asyncio.CancelledError:
+                pass
+        _prewarm_task = None
+
+    async def _await_tts_prewarm(lang: str, *, after_abort: bool = False):
+        await _cancel_prewarm_task()
+        await tts_session.prewarm(lang, after_abort=after_abort)
+
     def _interrupt():
         if _is_farewell:
             return
@@ -169,12 +183,12 @@ async def audio_ws(websocket: WebSocket):
             else:
                 logger.warning("[TTS] Stream failed — falling back to speak_full")
                 await tts_session.abort()
-                _schedule_tts_prewarm(tts_lang, after_abort=True)
+                await _await_tts_prewarm(tts_lang, after_abort=True)
                 await _speak_full_turn(fallback_text, tts_lang, cancel)
         except Exception as e:
             logger.error(f"[TTS] end_turn error: {e}")
             await tts_session.abort()
-            _schedule_tts_prewarm(tts_lang, after_abort=True)
+            await _await_tts_prewarm(tts_lang, after_abort=True)
             await _speak_full_turn(fallback_text, tts_lang, cancel)
 
     async def _speak_full_turn(text: str, tts_lang: str, cancel: asyncio.Event, cancellable: bool = True):
@@ -301,6 +315,7 @@ async def audio_ws(websocket: WebSocket):
                 elif _tts_aborted_for_retry:
                     _tts_streaming = False
                     _tts_aborted_for_retry = False
+                    await _await_tts_prewarm(tts_lang, after_abort=True)
                     await _speak_full_turn(text, tts_lang, _turn_cancel)
                 elif _tts_streaming:
                     _tts_streaming = False
@@ -371,6 +386,7 @@ async def audio_ws(websocket: WebSocket):
     async def _run_farewell_tts(text: str, tts_lang: str):
         if stop_event.is_set():
             return
+        await _await_tts_prewarm(tts_lang, after_abort=True)
         await _speak_full_turn(text, tts_lang, _turn_cancel, cancellable=False)
         logger.info("[FAREWELL] TTS complete — closing WebSocket")
         await _send({"type": "session_end"})
