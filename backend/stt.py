@@ -16,8 +16,20 @@ from sarvamai import AsyncSarvamAI
 logger = logging.getLogger("stt")
 
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
-#SEND_CHUNK_BYTES = 8192
 SEND_CHUNK_BYTES = 4096
+
+_stt_fields_logged = False
+
+
+def _extract_is_final(data) -> bool | None:
+    """Best-effort final/interim flag from Sarvam STT data object."""
+    for attr in ("is_final", "final", "is_partial"):
+        val = getattr(data, attr, None)
+        if val is not None:
+            if attr == "is_partial":
+                return not bool(val)
+            return bool(val)
+    return None
 
 
 async def run_streaming_stt(
@@ -25,6 +37,7 @@ async def run_streaming_stt(
     event_callback,
     stop_event: asyncio.Event,
 ):
+    global _stt_fields_logged
     client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
 
     async with client.speech_to_text_streaming.connect(
@@ -33,7 +46,7 @@ async def run_streaming_stt(
         language_code="unknown",
         sample_rate=16000,
         input_audio_codec="pcm_s16le",
-        high_vad_sensitivity=False,
+        high_vad_sensitivity=True,
         vad_signals=True,
     ) as sarvam_ws:
 
@@ -69,6 +82,7 @@ async def run_streaming_stt(
             logger.info(f"[SARVAM] Sender done. Total: {chunks_sent} chunks")
 
         async def receiver():
+            global _stt_fields_logged
             async for msg in sarvam_ws:
                 if stop_event.is_set():
                     break
@@ -86,14 +100,24 @@ async def run_streaming_stt(
                         await event_callback("speech_end", "")
 
                 elif msg_type == "data" and data is not None:
+                    if not _stt_fields_logged:
+                        logger.info(
+                            f"[STT DATA FIELDS] is_final={_extract_is_final(data)} "
+                            f"lang={getattr(data, 'language_code', None)}"
+                        )
+                        _stt_fields_logged = True
+
                     transcript = getattr(data, "transcript", "") or ""
                     if transcript:
                         detected_lang = getattr(data, "language_code", None)
+                        is_final = _extract_is_final(data)
                         if detected_lang:
                             logger.info(f"USER [{detected_lang}]: {transcript}")
                         else:
                             logger.info(f"USER: {transcript}")
-                        await event_callback("transcript", transcript, detected_lang)
+                        await event_callback(
+                            "transcript", transcript, detected_lang, is_final=is_final
+                        )
 
                 else:
                     logger.debug(f"[SARVAM UNKNOWN] {msg}")

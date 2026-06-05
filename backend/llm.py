@@ -210,6 +210,7 @@ async def stream_llm_response(
     event_callback,
     cancel_event: asyncio.Event = None,
     stt_lang: str | None = None,
+    on_language_retry=None,
 ):
     if cancel_event is None:
         cancel_event = asyncio.Event()
@@ -245,6 +246,8 @@ async def stream_llm_response(
         logger.warning(
             f"[LLM] Language mismatch (wanted {response_language}): {final_text[:80]!r} — retrying"
         )
+        if on_language_retry:
+            await on_language_retry()
         retry_content = f"{RETRY_INSTRUCTIONS[response_language]}\n{transcript}"
         retry_messages = [
             {"role": "system", "content": SYSTEM_PROMPT},

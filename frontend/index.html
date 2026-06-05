@@ -313,37 +313,29 @@
   let currentAiTextEl = null;
   let currentAiBuffer = '';
 
-  // ── TTS Audio Engine ───────────────────────────────────────────────────
+  // ── TTS Audio Engine (PCM s16le @ 16kHz from Sarvam TTS WebSocket) ───
   //
-  // INTERRUPT DESIGN:
-  //   Uses Web Audio API scheduled BufferSourceNodes.
-  //   Each decoded MP3 chunk becomes a node scheduled at ttsNextPlayAt.
-  //   On interrupt: src.stop(0) kills ALL nodes — including pre-scheduled
-  //   future ones — instantly. No tail audio plays after stopTtsNow().
-  //
-  //   Streaming latency is preserved: chunks still flow LLM→TTS→WS→browser
-  //   continuously. We just decode them into stoppable nodes instead of
-  //   a single audio element.
+  // INTERRUPT: scheduled BufferSourceNodes; stopTtsNow() kills all instantly.
+  // PCM chunks play immediately — no MP3 decode buffer / accumulation delay.
   //
   let ttsAudioCtx      = null;
-  let ttsNextPlayAt    = 0;         // Web Audio scheduling cursor
-  let ttsChunkBuffer   = [];        // Raw MP3 byte accumulator (Uint8Array[])
+  let ttsNextPlayAt    = 0;
   let ttsPlaying       = false;
-  let ttsScheduled     = [];        // All live AudioBufferSourceNodes — for stop()
+  let ttsScheduled     = [];
   let ttsSessionId     = 0;
   let activeTtsSession = 0;
+  let ttsSampleRate    = 16000;
+  let ttsDecodeGeneration = 0;
+  let llmThinking      = false;
   let farewellMode           = false;
-  let micSending             = true;
+  let greetingMode           = false;
+  let micSending             = false;
   let farewellCleanupScheduled = false;
-
-  // Minimum bytes before we attempt MP3 decode.
-  // MP3 needs complete frames; too small = decode error.
-  // 32KB ≈ 2s at 128kbps — adjust lower if your TTS chunks are larger.
-  const TTS_DECODE_THRESHOLD = 32 * 1024;
+  let greetingTimeoutId      = null;
 
   function getTtsAudioCtx() {
     if (!ttsAudioCtx || ttsAudioCtx.state === 'closed') {
-      ttsAudioCtx  = new AudioContext();
+      ttsAudioCtx  = new AudioContext({ sampleRate: ttsSampleRate });
       ttsNextPlayAt = 0;
     }
     return ttsAudioCtx;
@@ -351,12 +343,12 @@
 
   function invalidateTtsSession() {
     activeTtsSession = 0;
+    ttsDecodeGeneration++;
   }
 
-  // Called on interrupt — stops ALL scheduled audio nodes immediately.
   function stopTtsNow() {
+    ttsDecodeGeneration++;
     ttsPlaying     = false;
-    ttsChunkBuffer = [];
     ttsScheduled.forEach(src => {
       try { src.stop(0); } catch (_) {}
     });
@@ -372,59 +364,39 @@
     stopTtsNow();
     activeTtsSession = ++ttsSessionId;
     ttsPlaying       = true;
-    ttsChunkBuffer   = [];
     const ctx        = getTtsAudioCtx();
     ttsNextPlayAt    = ctx.currentTime;
   }
 
-  async function enqueueTtsChunk(arrayBuffer, sessionId) {
+  function enqueuePcmChunk(arrayBuffer, sessionId) {
     if (!ttsPlaying || sessionId !== activeTtsSession) return;
-    ttsChunkBuffer.push(new Uint8Array(arrayBuffer));
-    const totalBytes = ttsChunkBuffer.reduce((s, c) => s + c.length, 0);
-    if (totalBytes >= TTS_DECODE_THRESHOLD) {
-      await flushTtsBuffer();
-    }
-  }
+    const generation = ttsDecodeGeneration;
+    const ctx = getTtsAudioCtx();
+    const int16 = new Int16Array(arrayBuffer);
+    if (int16.length === 0) return;
 
-  async function flushTtsBuffer() {
-    const session = activeTtsSession;
-    if (ttsChunkBuffer.length === 0) return;
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
 
-    const totalBytes = ttsChunkBuffer.reduce((s, c) => s + c.length, 0);
-    const merged     = new Uint8Array(totalBytes);
-    let offset       = 0;
-    for (const chunk of ttsChunkBuffer) {
-      merged.set(chunk, offset);
-      offset += chunk.length;
-    }
-    ttsChunkBuffer = [];
+    if (generation !== ttsDecodeGeneration || sessionId !== activeTtsSession || !ttsPlaying) return;
 
-    if (session !== activeTtsSession || !ttsPlaying) return;
+    const audioBuffer = ctx.createBuffer(1, float32.length, ttsSampleRate);
+    audioBuffer.getChannelData(0).set(float32);
 
-    try {
-      const ctx = getTtsAudioCtx();
-      const audioBuffer = await ctx.decodeAudioData(merged.buffer);
+    if (generation !== ttsDecodeGeneration || sessionId !== activeTtsSession || !ttsPlaying) return;
 
-      if (session !== activeTtsSession || !ttsPlaying) return;
+    const src = ctx.createBufferSource();
+    src.buffer = audioBuffer;
+    src.connect(ctx.destination);
+    src.onended = () => {
+      ttsScheduled = ttsScheduled.filter(s => s !== src);
+    };
 
-      const src = ctx.createBufferSource();
-      src.buffer = audioBuffer;
-      src.connect(ctx.destination);
-
-      src.onended = () => {
-        ttsScheduled = ttsScheduled.filter(s => s !== src);
-      };
-
-      const now   = ctx.currentTime;
-      const start = Math.max(now + 0.05, ttsNextPlayAt);
-      src.start(start);
-      ttsNextPlayAt = start + audioBuffer.duration;
-
-      ttsScheduled.push(src);
-
-    } catch (err) {
-      console.warn('[TTS] Decode error (partial frame?):', err.message);
-    }
+    const now   = ctx.currentTime;
+    const start = Math.max(now + 0.02, ttsNextPlayAt);
+    src.start(start);
+    ttsNextPlayAt = start + audioBuffer.duration;
+    ttsScheduled.push(src);
   }
 
   function resetTtsEngine() {
@@ -608,9 +580,9 @@
   // ── WebSocket message handler ──────────────────────────────────────────
   function handleMessage(evt) {
 
-    // Binary frame = TTS audio chunk
+    // Binary frame = TTS PCM audio chunk
     if (evt.data instanceof ArrayBuffer) {
-      if (ttsPlaying) enqueueTtsChunk(evt.data, activeTtsSession);
+      if (ttsPlaying) enqueuePcmChunk(evt.data, activeTtsSession);
       return;
     }
 
@@ -623,7 +595,8 @@
       // Server confirms cancellation of LLM+TTS tasks.
       // Stop all audio immediately — this is the core of interrupt handling.
       case 'interrupted':
-        if (farewellMode) break;
+        if (farewellMode || greetingMode) break;
+        llmThinking = false;
         stopTtsNow();
         invalidateTtsSession();
         markAiTurnInterrupted();
@@ -631,8 +604,30 @@
         addTranscriptLine('t-event', '── interrupted');
         break;
 
+      case 'greeting_start':
+        greetingMode = true;
+        micSending = false;
+        setStatus('speaking', 'Susha introducing...');
+        if (msg.text) addTranscriptLine('t-ai', msg.text);
+        if (greetingTimeoutId) clearTimeout(greetingTimeoutId);
+        greetingTimeoutId = setTimeout(() => {
+          if (greetingMode) {
+            greetingMode = false;
+            micSending = true;
+            setStatus('listening', 'Listening · Speak now');
+          }
+        }, 8000);
+        break;
+
+      case 'greeting_end':
+        greetingMode = false;
+        micSending = true;
+        if (greetingTimeoutId) { clearTimeout(greetingTimeoutId); greetingTimeoutId = null; }
+        setStatus('listening', 'Listening · Speak now');
+        break;
+
       case 'speech_start':
-        if (farewellMode) break;
+        if (farewellMode || greetingMode) break;
         stopTtsNow();
         invalidateTtsSession();
         setStatus('speech', 'Listening · Speech detected');
@@ -650,8 +645,7 @@
 
       case 'llm_start':
         if (farewellMode) break;
-        stopTtsNow();
-        invalidateTtsSession();
+        llmThinking = true;
         setStatus('thinking', 'AI thinking...');
         startAiTurn();
         break;
@@ -661,7 +655,7 @@
         break;
 
       case 'llm_end':
-        setStatus('listening', 'Listening · Speak now');
+        llmThinking = false;
         finalizeAiTurn(msg.text || '');
         break;
 
@@ -687,14 +681,23 @@
         break;
 
       case 'tts_start':
+        if (msg.sampleRate) ttsSampleRate = msg.sampleRate;
         beginTtsSession();
-        setStatus('speaking', farewellMode ? 'Goodbye...' : 'AI speaking...');
+        if (greetingMode) {
+          setStatus('speaking', 'Susha introducing...');
+        } else {
+          setStatus('speaking', farewellMode ? 'Goodbye...' : 'AI speaking...');
+        }
         break;
 
       case 'tts_end':
         {
           const endSession = activeTtsSession;
-          flushTtsBuffer().then(() => {
+          const ctx = ttsAudioCtx;
+          const remainingMs = ctx && ctx.state !== 'closed'
+            ? Math.max(0, (ttsNextPlayAt - ctx.currentTime) * 1000) + 100
+            : 0;
+          setTimeout(() => {
             if (endSession !== activeTtsSession) return;
             if (farewellMode) {
               waitForTtsPlaybackThenCleanup();
@@ -702,7 +705,7 @@
               ttsPlaying = false;
               setStatus('listening', 'Listening · Speak now');
             }
-          });
+          }, remainingMs);
         }
         break;
     }
@@ -716,12 +719,14 @@
 
     try {
       farewellMode = false;
-      micSending = true;
+      greetingMode = false;
+      micSending = false;
       farewellCleanupScheduled = false;
+      if (greetingTimeoutId) { clearTimeout(greetingTimeoutId); greetingTimeoutId = null; }
       ws = new WebSocket(WS_URL);
       ws.binaryType = 'arraybuffer';
 
-      ws.onopen    = () => { setStatus('connected', 'Connected · Starting mic...'); startMic(); };
+      ws.onopen    = () => { setStatus('connected', 'Connected · Susha is greeting you...'); startMic(); };
       ws.onmessage = handleMessage;
       ws.onerror   = () => { setStatus('error', 'WebSocket error'); addTranscriptLine('t-error', 'WebSocket error'); if (!farewellMode) cleanup(); else waitForTtsPlaybackThenCleanup(); };
       ws.onclose   = () => {
@@ -784,8 +789,9 @@
         // This fires BEFORE Sarvam VAD — gives ~200-400ms earlier interrupt.
         // Only send to server if AI is currently active (TTS playing or LLM running).
         if (e.data && e.data.type === 'speech_energy_detected') {
-          if (farewellMode) return;
-          if (ttsPlaying && ws && ws.readyState === WebSocket.OPEN) {
+          if (farewellMode || greetingMode) return;
+          if ((ttsPlaying || llmThinking) && ws && ws.readyState === WebSocket.OPEN) {
+            llmThinking = false;
             stopTtsNow();
             invalidateTtsSession();
             ws.send(JSON.stringify({ type: 'client_interrupt' }));
@@ -818,7 +824,9 @@
 
   function cleanup() {
     farewellMode = false;
+    greetingMode = false;
     micSending = false;
+    if (greetingTimeoutId) { clearTimeout(greetingTimeoutId); greetingTimeoutId = null; }
     farewellCleanupScheduled = false;
     stopMicAndWs();
     if (ws && ws.readyState === WebSocket.OPEN) { ws.close(); ws = null; }
